@@ -93,8 +93,6 @@ const (
 	MinSignedPerWindow = 0.05
 	// MaxMissedBeforeJail is the maximum missed blocks before jailing: 10000 - (10000 * 0.05) = 9500.
 	MaxMissedBeforeJail = 9500
-	// MissedBlocksAlertThreshold is the missed block count where we start alerting (20% of window = ~3 hours).
-	MissedBlocksAlertThreshold = 2000
 	// QuorumBufferPoints is the desired-state margin above the on-chain quorum
 	// parameter: turnout should clear quorum by at least 10 percentage points.
 	QuorumBufferPoints = 0.10
