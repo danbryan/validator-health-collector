@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cosmos/platform/apps/validator-health-collector/cosmosaddr"
+	"github.com/cosmos/platform/apps/validator-health-collector/endpoints"
 )
 
 // GovVote is a single validator's vote on a proposal, resolved to an entity.
@@ -142,7 +143,7 @@ type GovBackfiller struct {
 }
 
 func NewGovBackfiller(rpcURLs ...string) *GovBackfiller {
-	g := &GovBackfiller{client: &http.Client{Timeout: 60 * time.Second}}
+	g := &GovBackfiller{client: endpoints.NewHTTPClient(60 * time.Second)}
 	g.SetEndpoints(rpcURLs)
 	return g
 }

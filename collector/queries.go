@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/cosmos/platform/apps/validator-health-collector/endpoints"
 )
 
 const restTimeout = 30 * time.Second
@@ -21,7 +23,7 @@ type RESTClient struct {
 
 // NewRESTClient builds a client over one or more ranked base URLs.
 func NewRESTClient(baseURLs ...string) *RESTClient {
-	c := &RESTClient{client: &http.Client{Timeout: restTimeout}}
+	c := &RESTClient{client: endpoints.NewHTTPClient(restTimeout)}
 	c.SetEndpoints(baseURLs)
 	return c
 }
@@ -48,7 +50,7 @@ type RPCClient struct {
 
 // NewRPCClient builds a client over one or more ranked base URLs.
 func NewRPCClient(baseURLs ...string) *RPCClient {
-	c := &RPCClient{client: &http.Client{Timeout: restTimeout}}
+	c := &RPCClient{client: endpoints.NewHTTPClient(restTimeout)}
 	c.SetEndpoints(baseURLs)
 	return c
 }

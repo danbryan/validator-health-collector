@@ -59,7 +59,7 @@ type ChainAPIs struct {
 func FetchChain(registryURL, chain string) (ChainAPIs, error) {
 	url := fmt.Sprintf(registryURL, chain)
 
-	client := &http.Client{Timeout: registryTimeout}
+	client := NewHTTPClient(registryTimeout)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return ChainAPIs{}, fmt.Errorf("building registry request: %w", err)

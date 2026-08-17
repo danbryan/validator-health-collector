@@ -102,7 +102,7 @@ func probeAll(eps []Endpoint, fn func(Endpoint) Candidate) []Candidate {
 }
 
 func newProbeClient() *http.Client {
-	return &http.Client{Timeout: probeTimeout}
+	return NewHTTPClient(probeTimeout)
 }
 
 // getJSON issues a GET and decodes the body, capping how much is read so a
