@@ -492,6 +492,13 @@ func (c *Collector) Metrics() *Metrics {
 func (c *Collector) CollectSnapshot() error {
 	log.Println("Starting snapshot collection...")
 
+	// Fail closed before any network work. Every operational governance alert is
+	// gated on GovProposalLive, so retiring the previous cycle's gate here makes
+	// every return path safe, including endpoint, staking, and consensus failures
+	// that happen before governance can be queried. A proposal is republished as
+	// live only after its full analysis succeeds near the end of the cycle.
+	c.retireLiveProposalSeries()
+
 	// 0. Endpoint discovery. Every later query depends on this, so a failure here
 	// ends the cycle rather than producing a half-populated snapshot.
 	if err := c.resolveEndpoints(); err != nil {
@@ -570,8 +577,7 @@ func (c *Collector) CollectSnapshot() error {
 	// end, so CollectorStale eventually surfaces the blindness.
 	activeProps, govErr := c.restClient.QueryActiveProposals()
 	if govErr != nil {
-		log.Printf("WARN: Governance query failed, retiring live proposal series: %v", govErr)
-		c.retireLiveProposalSeries()
+		log.Printf("WARN: Governance query failed; live proposal series remain retired: %v", govErr)
 	}
 	govQuorum, _, govVeto, _ := c.restClient.QueryGovParams()
 	c.metrics.GovVetoThreshold.Set(govVeto)
@@ -773,9 +779,6 @@ func (c *Collector) CollectSnapshot() error {
 	// Historical series for closed proposals live in analyzeProposals and are kept
 	// deliberately, because the dashboard charts past turnout. The alerts are gated
 	// on validator_health_governance_proposal_live so that history cannot page.
-	if govErr == nil {
-		c.retireLiveProposalSeries()
-	}
 	for _, p := range activeProps {
 		endTime, err := time.Parse(time.RFC3339, p.VotingEndTime)
 		if err == nil {

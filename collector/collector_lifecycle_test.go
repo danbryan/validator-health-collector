@@ -1,12 +1,15 @@
 package collector //nolint:testpackage // The regression exercises private metric-retirement boundaries.
 
 import (
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/cosmos/platform/apps/validator-health-collector/endpoints"
 )
 
 func analysisTestCollector(rpcURL string) *Collector {
@@ -26,6 +29,45 @@ func liveProposalForTest() Proposal {
 		Status:          statusVotingPeriod,
 		VotingStartTime: "2026-08-04T00:00:00Z",
 		VotingEndTime:   "2026-08-18T00:00:00Z",
+	}
+}
+
+func TestCollectSnapshotRetiresLiveGateBeforeEndpointFailure(t *testing.T) {
+	t.Parallel()
+
+	// The registry is reachable, but its only advertised REST and RPC endpoint
+	// fails TLS verification. Resolution therefore returns no healthy endpoints
+	// and CollectSnapshot exits before making any chain query.
+	unhealthy := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer unhealthy.Close()
+
+	registry := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprintf(w, `{"chain_name":"cosmoshub","chain_id":"cosmoshub-4","apis":{"rest":[{"address":%q,"provider":"test"}],"rpc":[{"address":%q,"provider":"test"}]}}`, unhealthy.URL, unhealthy.URL)
+	}))
+	defer registry.Close()
+
+	c := New(endpoints.NewResolver(endpoints.Options{
+		RegistryURL: registry.URL + "/%s.json",
+		Chain:       "cosmoshub",
+	}), nil)
+	id := "1051"
+	c.metrics.GovProposalLive.WithLabelValues(id).Set(1)
+	c.metrics.GovTurnout.WithLabelValues(id).Set(0.2)
+	c.metrics.GovSecondsRemaining.WithLabelValues(id).Set(3600)
+
+	if err := c.CollectSnapshot(); err == nil {
+		t.Fatal("CollectSnapshot() succeeded despite having no healthy endpoints")
+	}
+	if got := testutil.ToFloat64(c.metrics.GovProposalLive.WithLabelValues(id)); got != 0 {
+		t.Errorf("proposal_live = %v, want the previous cycle's gate retired before endpoint resolution", got)
+	}
+	if got := testutil.ToFloat64(c.metrics.GovTurnout.WithLabelValues(id)); got != 0 {
+		t.Errorf("turnout = %v, want the previous cycle's live series retired", got)
+	}
+	if got := testutil.ToFloat64(c.metrics.GovSecondsRemaining.WithLabelValues(id)); got != 0 {
+		t.Errorf("seconds remaining = %v, want the previous cycle's live series retired", got)
 	}
 }
 
