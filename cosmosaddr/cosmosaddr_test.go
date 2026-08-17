@@ -3,7 +3,7 @@ package cosmosaddr_test
 import (
 	"testing"
 
-	"github.com/cosmos/platform/apps/validator-health-collector/cosmosaddr"
+	"github.com/danbryan/validator-health-collector/cosmosaddr"
 )
 
 // The expected values below were produced by the cosmos-sdk implementations this

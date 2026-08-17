@@ -1,4 +1,4 @@
-module github.com/cosmos/platform/apps/validator-health-collector
+module github.com/danbryan/validator-health-collector
 
 go 1.25.8
 

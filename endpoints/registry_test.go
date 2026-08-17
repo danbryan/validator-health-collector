@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cosmos/platform/apps/validator-health-collector/endpoints"
+	"github.com/danbryan/validator-health-collector/endpoints"
 )
 
 const sampleChainJSON = `{

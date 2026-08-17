@@ -9,7 +9,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"github.com/cosmos/platform/apps/validator-health-collector/endpoints"
+	"github.com/danbryan/validator-health-collector/endpoints"
 )
 
 func analysisTestCollector(rpcURL string) *Collector {

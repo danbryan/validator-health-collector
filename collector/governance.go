@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cosmos/platform/apps/validator-health-collector/cosmosaddr"
-	"github.com/cosmos/platform/apps/validator-health-collector/endpoints"
+	"github.com/danbryan/validator-health-collector/cosmosaddr"
+	"github.com/danbryan/validator-health-collector/endpoints"
 )
 
 // GovVote is a single validator's vote on a proposal, resolved to an entity.

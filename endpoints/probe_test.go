@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cosmos/platform/apps/validator-health-collector/endpoints"
+	"github.com/danbryan/validator-health-collector/endpoints"
 )
 
 func TestAddressesKeepsOnlyHealthyInOrder(t *testing.T) {

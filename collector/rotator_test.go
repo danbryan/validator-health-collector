@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/cosmos/platform/apps/validator-health-collector/collector"
+	"github.com/danbryan/validator-health-collector/collector"
 )
 
 // Rotation is exercised through the exported clients rather than the unexported

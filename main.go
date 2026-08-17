@@ -10,9 +10,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"github.com/cosmos/platform/apps/validator-health-collector/collector"
-	"github.com/cosmos/platform/apps/validator-health-collector/endpoints"
-	"github.com/cosmos/platform/apps/validator-health-collector/entity"
+	"github.com/danbryan/validator-health-collector/collector"
+	"github.com/danbryan/validator-health-collector/endpoints"
+	"github.com/danbryan/validator-health-collector/entity"
 )
 
 func main() {

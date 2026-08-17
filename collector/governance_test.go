@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/cosmos/platform/apps/validator-health-collector/collector"
+	"github.com/danbryan/validator-health-collector/collector"
 )
 
 // txSearchBody renders a tx_search response with the given match count and no

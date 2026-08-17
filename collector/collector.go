@@ -12,8 +12,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/cosmos/platform/apps/validator-health-collector/cosmosaddr"
-	"github.com/cosmos/platform/apps/validator-health-collector/endpoints"
+	"github.com/danbryan/validator-health-collector/cosmosaddr"
+	"github.com/danbryan/validator-health-collector/endpoints"
 )
 
 // consensusAddressFromPubKey derives a cosmosvalcons address from a base64-encoded ed25519 consensus pubkey.

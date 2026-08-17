@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cosmos/platform/apps/validator-health-collector/endpoints"
+	"github.com/danbryan/validator-health-collector/endpoints"
 )
 
 const restTimeout = 30 * time.Second
