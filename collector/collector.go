@@ -130,6 +130,8 @@ type Metrics struct {
 	BondedTokens           prometheus.Gauge
 	GovAttributionComplete *prometheus.GaugeVec
 	EndpointInfo           *prometheus.GaugeVec
+	GovProposalLive        *prometheus.GaugeVec
+	SectionSuccess         *prometheus.GaugeVec
 }
 
 func NewMetrics() *Metrics {
@@ -294,6 +296,14 @@ func NewMetrics() *Metrics {
 			Name: "validator_health_collector_endpoint_info",
 			Help: "The endpoint the collector selected for each protocol, as a labelled constant 1.",
 		}, []string{"protocol", "provider", "url"}),
+		GovProposalLive: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_governance_proposal_live",
+			Help: "1 while a proposal's voting period is open and this cycle confirmed it. Absent for closed proposals and cleared when the governance query fails, so time-bound alerts cannot fire on stale data.",
+		}, []string{"proposal_id"}),
+		SectionSuccess: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_collector_section_success",
+			Help: "Whether the last attempt at a section of the collection cycle succeeded (1) or failed (0).",
+		}, []string{"section"}),
 	}
 }
 
@@ -339,6 +349,8 @@ func (m *Metrics) Describe(ch chan<- *prometheus.Desc) {
 	m.BondedTokens.Describe(ch)
 	m.GovAttributionComplete.Describe(ch)
 	m.EndpointInfo.Describe(ch)
+	m.GovProposalLive.Describe(ch)
+	m.SectionSuccess.Describe(ch)
 }
 
 // Collect implements prometheus.Collector.
@@ -383,6 +395,8 @@ func (m *Metrics) Collect(ch chan<- prometheus.Metric) {
 	m.BondedTokens.Collect(ch)
 	m.GovAttributionComplete.Collect(ch)
 	m.EndpointInfo.Collect(ch)
+	m.GovProposalLive.Collect(ch)
+	m.SectionSuccess.Collect(ch)
 }
 
 // Collector orchestrates the polling and metric updates.
@@ -548,10 +562,19 @@ func (c *Collector) CollectSnapshot() error {
 	}
 
 	// 4. Governance
-	activeProps, err := c.restClient.QueryActiveProposals()
-	if err != nil {
-		log.Printf("WARN: Governance query failed: %v", err)
+	//
+	// A failure here is not just logged. Every governance series that describes an
+	// open voting period is retired immediately, because leaving the previous
+	// cycle's values in place lets time-bound alerts keep firing on a snapshot
+	// nobody can refresh. The cycle also stops reporting itself successful at the
+	// end, so CollectorStale eventually surfaces the blindness.
+	activeProps, govErr := c.restClient.QueryActiveProposals()
+	if govErr != nil {
+		log.Printf("WARN: Governance query failed, retiring live proposal series: %v", govErr)
+		c.retireLiveProposalSeries()
 	}
+	c.metrics.SectionSuccess.WithLabelValues("governance").Set(boolGauge(govErr == nil))
+
 	govQuorum, _, govVeto, _ := c.restClient.QueryGovParams()
 	c.metrics.GovVetoThreshold.Set(govVeto)
 	if govQuorum > 0 {
@@ -739,7 +762,22 @@ func (c *Collector) CollectSnapshot() error {
 		log.Printf("Safety coefficient: %d", safetyCount)
 	}
 
-	// Governance metrics
+	// Governance metrics for proposals whose voting is still open.
+	//
+	// The whole set is retired and republished each cycle rather than updated in
+	// place. A proposal that closes simply stops appearing in activeProps, and
+	// without this its last values would persist forever: seconds-remaining
+	// clamped to zero and turnout frozen below quorum, which permanently satisfies
+	// GovernanceQuorumRisk, QuorumBufferBelowTarget and QuorumNotMet. That would
+	// page the ecosystem about a vote that has already ended and can no longer be
+	// influenced.
+	//
+	// Historical series for closed proposals live in analyzeProposals and are kept
+	// deliberately, because the dashboard charts past turnout. The alerts are gated
+	// on validator_health_governance_proposal_live so that history cannot page.
+	if govErr == nil {
+		c.retireLiveProposalSeries()
+	}
 	for _, p := range activeProps {
 		yes, _ := strconv.ParseFloat(p.FinalTallyResult.YesCount, 64)
 		no, _ := strconv.ParseFloat(p.FinalTallyResult.NoCount, 64)
@@ -761,6 +799,9 @@ func (c *Collector) CollectSnapshot() error {
 			}
 			c.metrics.GovSecondsRemaining.WithLabelValues(p.ID).Set(remaining)
 		}
+
+		// Only proposals confirmed open by this cycle may drive time-bound alerts.
+		c.metrics.GovProposalLive.WithLabelValues(p.ID).Set(1)
 	}
 
 	// Build consensus address -> moniker map from validator set
@@ -902,9 +943,31 @@ func (c *Collector) CollectSnapshot() error {
 		c.analyzeProposals(activeProps, validators, bondedTokens, govQuorum)
 	}
 
+	// A partial snapshot is published, because concentration and signing metrics are
+	// independent of governance and still accurate. It is not reported as a success:
+	// advancing LastSuccess here would keep CollectorStale quiet while governance
+	// values silently aged, which is the combination that lets stale data page.
+	if govErr != nil {
+		log.Println("Snapshot collection finished with a governance failure; not marking it successful.")
+		return fmt.Errorf("governance query failed: %w", govErr)
+	}
+
 	c.metrics.LastSuccess.Set(float64(time.Now().Unix()))
 	log.Println("Snapshot collection complete.")
 	return nil
+}
+
+// retireLiveProposalSeries drops every governance series that is only meaningful
+// while a proposal's voting period is open.
+//
+// Kept deliberately narrow. Series that describe a finished vote, such as the
+// tally, per-entity votes and the turnout timeline, are what the dashboard charts
+// historically and are not touched here.
+func (c *Collector) retireLiveProposalSeries() {
+	c.metrics.GovProposalLive.Reset()
+	c.metrics.GovSecondsRemaining.Reset()
+	c.metrics.GovTurnout.Reset()
+	c.metrics.GovQuorum.Reset()
 }
 
 // analyzeProposals discovers which proposals to report on, then publishes
