@@ -1,0 +1,8 @@
+deploy/
+docker-compose.yml
+.git/
+*.md
+
+# The locally built binary is 43MB and would be copied into the build context only
+# to be overwritten by the in-container build.
+validator-health-collector

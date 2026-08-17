@@ -1,0 +1,7 @@
+# Entity map for validator health monitoring.
+# Default: each validator is its own entity unless listed here.
+entities:
+  - name: Coinbase
+    validators:
+      - cosmosvaloper10sjr8xv2yr83agmzw7acf6xxqrw8e3q6wvh5ne  # Coinbase01
+      - cosmosvaloper1gqem6t55xrjc8nqf7y8jyp9xzgnm60zu007nrl  # Coinbase02
