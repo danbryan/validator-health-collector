@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cosmos/cosmos-sdk/types/bech32"
+	"github.com/cosmos/platform/apps/validator-health-collector/cosmosaddr"
 )
 
 // GovVote is a single validator's vote on a proposal, resolved to an entity.
@@ -122,11 +122,7 @@ func voteOptionName(opt int) string {
 
 // accToValoper converts a cosmos1... account address to cosmosvaloper1...
 func accToValoper(acc string) (string, error) {
-	_, data, err := bech32.DecodeAndConvert(acc)
-	if err != nil {
-		return "", err
-	}
-	return bech32.ConvertAndEncode("cosmosvaloper", data)
+	return cosmosaddr.Reprefix(acc, "cosmosvaloper")
 }
 
 // maxTxAttempts caps how many RPC endpoints one proposal's vote backfill will

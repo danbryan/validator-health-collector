@@ -1,8 +1,6 @@
 package collector
 
 import (
-	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -12,37 +10,29 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cosmos/cosmos-sdk/crypto/keys/ed25519"
-	"github.com/cosmos/cosmos-sdk/types/bech32"
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/cosmos/platform/apps/validator-health-collector/cosmosaddr"
 	"github.com/cosmos/platform/apps/validator-health-collector/endpoints"
 )
 
 // consensusAddressFromPubKey derives a cosmosvalcons address from a base64-encoded ed25519 consensus pubkey.
 func consensusAddressFromPubKey(pubKeyBase64 string) (string, error) {
-	pubKeyBytes, err := base64.StdEncoding.DecodeString(pubKeyBase64)
+	addr, err := cosmosaddr.FromEd25519PubKey(pubKeyBase64)
 	if err != nil {
 		return "", err
 	}
-	pk := &ed25519.PubKey{Key: pubKeyBytes}
-	addr := pk.Address()
-	bech, err := bech32.ConvertAndEncode("cosmosvalcons", addr)
-	if err != nil {
-		return "", err
-	}
-	return bech, nil
+	return cosmosaddr.Encode("cosmosvalcons", addr)
 }
 
 // consensusHexFromPubKey derives the uppercase hex consensus address that
 // CometBFT uses to identify a validator in the consensus set.
 func consensusHexFromPubKey(pubKeyBase64 string) (string, error) {
-	pubKeyBytes, err := base64.StdEncoding.DecodeString(pubKeyBase64)
+	addr, err := cosmosaddr.FromEd25519PubKey(pubKeyBase64)
 	if err != nil {
 		return "", err
 	}
-	pk := &ed25519.PubKey{Key: pubKeyBytes}
-	return strings.ToUpper(hex.EncodeToString(pk.Address())), nil
+	return cosmosaddr.HexAddress(addr), nil
 }
 
 // defaultSecondsPerBlock is used only until the real interval has been measured
