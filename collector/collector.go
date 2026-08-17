@@ -573,8 +573,6 @@ func (c *Collector) CollectSnapshot() error {
 		log.Printf("WARN: Governance query failed, retiring live proposal series: %v", govErr)
 		c.retireLiveProposalSeries()
 	}
-	c.metrics.SectionSuccess.WithLabelValues("governance").Set(boolGauge(govErr == nil))
-
 	govQuorum, _, govVeto, _ := c.restClient.QueryGovParams()
 	c.metrics.GovVetoThreshold.Set(govVeto)
 	if govQuorum > 0 {
@@ -779,18 +777,6 @@ func (c *Collector) CollectSnapshot() error {
 		c.retireLiveProposalSeries()
 	}
 	for _, p := range activeProps {
-		yes, _ := strconv.ParseFloat(p.FinalTallyResult.YesCount, 64)
-		no, _ := strconv.ParseFloat(p.FinalTallyResult.NoCount, 64)
-		abstain, _ := strconv.ParseFloat(p.FinalTallyResult.AbstainCount, 64)
-		veto, _ := strconv.ParseFloat(p.FinalTallyResult.NoWithVetoCount, 64)
-		totalVotes := yes + no + abstain + veto
-
-		if totalBonded > 0 {
-			turnout := totalVotes / totalBonded
-			c.metrics.GovTurnout.WithLabelValues(p.ID).Set(turnout)
-			c.metrics.GovQuorum.WithLabelValues(p.ID).Set(govQuorum)
-		}
-
 		endTime, err := time.Parse(time.RFC3339, p.VotingEndTime)
 		if err == nil {
 			remaining := time.Until(endTime).Seconds()
@@ -799,9 +785,6 @@ func (c *Collector) CollectSnapshot() error {
 			}
 			c.metrics.GovSecondsRemaining.WithLabelValues(p.ID).Set(remaining)
 		}
-
-		// Only proposals confirmed open by this cycle may drive time-bound alerts.
-		c.metrics.GovProposalLive.WithLabelValues(p.ID).Set(1)
 	}
 
 	// Build consensus address -> moniker map from validator set
@@ -939,17 +922,24 @@ func (c *Collector) CollectSnapshot() error {
 	// Selection is dynamic: every currently-voting proposal, plus the most recent
 	// closed ones for historical reference. A closed proposal's vote history is
 	// immutable, so it is analyzed once and then skipped on later cycles.
-	if bondedTokens > 0 {
-		c.analyzeProposals(activeProps, validators, bondedTokens, govQuorum)
+	var analysisErr error
+	if govErr == nil {
+		if bondedTokens > 0 {
+			analysisErr = c.analyzeProposals(activeProps, validators, bondedTokens, govQuorum)
+		} else if len(activeProps) > 0 {
+			analysisErr = errors.New("cannot analyze active proposals without the bonded staking pool")
+		}
 	}
+	governanceErr := errors.Join(govErr, analysisErr)
+	c.metrics.SectionSuccess.WithLabelValues("governance").Set(boolGauge(governanceErr == nil))
 
 	// A partial snapshot is published, because concentration and signing metrics are
 	// independent of governance and still accurate. It is not reported as a success:
 	// advancing LastSuccess here would keep CollectorStale quiet while governance
 	// values silently aged, which is the combination that lets stale data page.
-	if govErr != nil {
+	if governanceErr != nil {
 		log.Println("Snapshot collection finished with a governance failure; not marking it successful.")
-		return fmt.Errorf("governance query failed: %w", govErr)
+		return fmt.Errorf("governance collection failed: %w", governanceErr)
 	}
 
 	c.metrics.LastSuccess.Set(float64(time.Now().Unix()))
@@ -970,6 +960,37 @@ func (c *Collector) retireLiveProposalSeries() {
 	c.metrics.GovQuorum.Reset()
 }
 
+// retireProposalAnalysisSeries removes the dynamic analysis for one live
+// proposal before that proposal is refreshed.
+//
+// Analysis series use the same metric families for live and historical
+// proposals, so resetting the whole vectors would erase the closed-proposal
+// history used by the dashboard. Deleting only this proposal prevents an old
+// quorum buffer, tally, or voter breakdown from surviving a failed refresh while
+// leaving every other proposal intact.
+func (c *Collector) retireProposalAnalysisSeries(id string) {
+	labels := prometheus.Labels{"proposal_id": id}
+	c.metrics.GovProposalInfo.DeletePartialMatch(labels)
+	c.metrics.GovProposalQuorum.DeletePartialMatch(labels)
+	c.metrics.GovProposalTally.DeletePartialMatch(labels)
+	c.metrics.GovEntityVote.DeletePartialMatch(labels)
+	c.metrics.GovNonVoterPower.DeletePartialMatch(labels)
+	c.metrics.GovTurnoutTimeline.DeletePartialMatch(labels)
+	c.metrics.GovWindow.DeletePartialMatch(labels)
+	c.metrics.GovParticipationCount.DeletePartialMatch(labels)
+	c.metrics.GovAttributionComplete.DeletePartialMatch(labels)
+	c.metrics.GovQuorumBuffer.DeletePartialMatch(labels)
+	c.metrics.GovQuorumTarget.DeletePartialMatch(labels)
+
+	// The alert gate, turnout, and quorum are analysis-derived too: they stay
+	// absent until everything above has been republished successfully. Time
+	// remaining comes directly from the confirmed-open proposal record and cannot
+	// alert without the gate.
+	c.metrics.GovProposalLive.DeleteLabelValues(id)
+	c.metrics.GovTurnout.DeleteLabelValues(id)
+	c.metrics.GovQuorum.DeleteLabelValues(id)
+}
+
 // analyzeProposals discovers which proposals to report on, then publishes
 // per-entity vote data and turnout timelines for each.
 //
@@ -980,13 +1001,14 @@ func (c *Collector) analyzeProposals(
 	activeProps []Proposal,
 	validators []Validator,
 	bondedTokens, quorum float64,
-) {
+) error {
 	type target struct {
 		prop   Proposal
 		isLive bool
 	}
 	var targets []target
 	seen := make(map[string]bool)
+	var liveErrors []error
 
 	// Live proposals first. These change while voting is open, so they are
 	// always re-analyzed.
@@ -1020,11 +1042,20 @@ func (c *Collector) analyzeProposals(
 		}
 		id := t.prop.ID
 		prop := &t.prop
+		if t.isLive {
+			// A live proposal changes every cycle. Clear its previous analysis before
+			// attempting the refresh so a failed endpoint cannot leave old quorum or
+			// voter data looking current.
+			c.retireProposalAnalysisSeries(id)
+		}
 
 		analysis, err := c.govBackfiller.AnalyzeProposal(prop, validators, c.entityMap,
 			bondedTokens, quorum, c.blockIntervalOrDefault(), c.restClient.QueryLiveTally)
 		if err != nil {
 			log.Printf("WARN: proposal %s analysis failed: %v", id, err)
+			if t.isLive {
+				liveErrors = append(liveErrors, fmt.Errorf("active proposal %s: %w", id, err))
+			}
 			continue
 		}
 
@@ -1136,7 +1167,20 @@ func (c *Collector) analyzeProposals(
 			).Set(running)
 		}
 
-		c.trackedProposals[id] = true
+		if t.isLive {
+			// Live proposal records expose a zeroed final_tally_result. Publish the
+			// authoritative turnout calculated from QueryLiveTally here, alongside
+			// the quorum used by the same analysis, then publish the alert gate last.
+			c.metrics.GovTurnout.WithLabelValues(id).Set(analysis.FinalTurnout)
+			c.metrics.GovQuorum.WithLabelValues(id).Set(quorum)
+			c.metrics.GovProposalLive.WithLabelValues(id).Set(1)
+		} else {
+			// Mark a proposal immutable only after analyzing its final closed state.
+			// Recording it while live would skip the one final refresh after voting
+			// closes and leave the dashboard with a VOTING_PERIOD status and partial
+			// turnout forever.
+			c.trackedProposals[id] = true
+		}
 
 		liveTag := ""
 		if t.isLive {
@@ -1145,6 +1189,8 @@ func (c *Collector) analyzeProposals(
 		log.Printf("Proposal %s (%s)%s: turnout %.2f%% vs quorum %.0f%%, %d entities voted, %d did not",
 			id, analysis.Status, liveTag, analysis.FinalTurnout*100, quorum*100, len(byEntity), len(nonVoterByEntity))
 	}
+
+	return errors.Join(liveErrors...)
 }
 
 // referenceTurnout returns the participation level used as the denominator for
