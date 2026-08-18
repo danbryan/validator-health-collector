@@ -117,8 +117,6 @@ func convert(in []registryAPI) []Endpoint {
 // deliberately short and are not a substitute for discovery.
 //
 // Chosen because each was observed serving Cosmos Hub mainnet on 2026-08-17.
-// The RPC list is ordered deepest-history-first, since the governance vote
-// backfill needs a node whose transaction index still covers the proposal.
 var (
 	FallbackREST = []Endpoint{
 		{Provider: "Allnodes", Address: "https://cosmos-rest.publicnode.com"},
@@ -128,9 +126,9 @@ var (
 	}
 
 	FallbackRPC = []Endpoint{
-		{Provider: "Citizen Web3 archive", Address: "https://rpc.cosmoshub-4-archive.citizenweb3.com"},
 		{Provider: "Allnodes", Address: "https://cosmos-rpc.publicnode.com"},
 		{Provider: "Lavender.Five", Address: "https://rpc.lavenderfive.com/cosmoshub"},
 		{Provider: "kjnodes", Address: "https://cosmoshub.rpc.kjnodes.com"},
+		{Provider: "Polkachu", Address: "https://cosmos-rpc.polkachu.com"},
 	}
 )

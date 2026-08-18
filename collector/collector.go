@@ -7,7 +7,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -33,23 +32,6 @@ func consensusHexFromPubKey(pubKeyBase64 string) (string, error) {
 		return "", err
 	}
 	return cosmosaddr.HexAddress(addr), nil
-}
-
-// defaultSecondsPerBlock is used only until the real interval has been measured
-// from the chain, which happens on every cycle before governance runs. Cosmos Hub
-// has sat near six seconds for years, so it is a safe starting point rather than
-// an assumption the metrics depend on.
-const defaultSecondsPerBlock = 6.0
-
-// blockIntervalOrDefault returns the measured block interval, falling back to the
-// nominal one before the first successful measurement.
-func (c *Collector) blockIntervalOrDefault() float64 {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	if c.lastBlockTime > 0 {
-		return c.lastBlockTime
-	}
-	return defaultSecondsPerBlock
 }
 
 // boolGauge maps a boolean onto the 1/0 a Prometheus gauge expects.
@@ -86,52 +68,58 @@ const (
 	// QuorumBufferPoints is the desired-state margin above the on-chain quorum
 	// parameter: turnout should clear quorum by at least 10 percentage points.
 	QuorumBufferPoints = 0.10
+	// DefaultProposalHistoryWindow matches the shortest metrics retention in the
+	// platform-dev monitoring stack: Mimir retains 14 days and Prometheus 15.
+	DefaultProposalHistoryWindow = 14 * 24 * time.Hour
 )
 
 // Metrics holds all Prometheus gauges for the validator health collector.
 type Metrics struct {
-	LastSuccess            prometheus.Gauge
-	QuerySuccess           *prometheus.GaugeVec
-	BlockHeight            prometheus.Gauge
-	ActiveValidators       prometheus.Gauge
-	LargestValShare        prometheus.Gauge
-	LargestEntShare        prometheus.Gauge
-	HaltCoeff              prometheus.Gauge
-	SafetyCoeff            prometheus.Gauge
-	GovTurnout             *prometheus.GaugeVec
-	GovQuorum              *prometheus.GaugeVec
-	GovSecondsRemaining    *prometheus.GaugeVec
-	ValMissedBlocks        *prometheus.GaugeVec
-	ValMissedBlocksInfo    *prometheus.GaugeVec
-	ValMissedRatio         *prometheus.GaugeVec
-	ValBlocksToJail        *prometheus.GaugeVec
-	ValSecondsToJail       *prometheus.GaugeVec
-	ValAtRiskPower         *prometheus.GaugeVec
-	SlashingParam          *prometheus.GaugeVec
-	ChainBlockTime         prometheus.Gauge
-	ValJailed              *prometheus.GaugeVec
-	ValInfo                *prometheus.GaugeVec
-	EntityShare            *prometheus.GaugeVec
-	GovProposalInfo        *prometheus.GaugeVec
-	GovProposalQuorum      *prometheus.GaugeVec
-	GovProposalTally       *prometheus.GaugeVec
-	GovEntityVote          *prometheus.GaugeVec
-	GovNonVoterPower       *prometheus.GaugeVec
-	GovTurnoutTimeline     *prometheus.GaugeVec
-	GovWindow              *prometheus.GaugeVec
-	GovParticipationCount  *prometheus.GaugeVec
-	GovVetoThreshold       prometheus.Gauge
-	EntityCanVetoAlone     *prometheus.GaugeVec
-	AnyEntityCanVeto       prometheus.Gauge
-	VetoPowerNeeded        prometheus.Gauge
-	GovQuorumBuffer        *prometheus.GaugeVec
-	GovQuorumTarget        *prometheus.GaugeVec
-	UpgradeHeight          *prometheus.GaugeVec
-	BondedTokens           prometheus.Gauge
-	GovAttributionComplete *prometheus.GaugeVec
-	EndpointInfo           *prometheus.GaugeVec
-	GovProposalLive        *prometheus.GaugeVec
-	SectionSuccess         *prometheus.GaugeVec
+	LastSuccess             prometheus.Gauge
+	QuerySuccess            *prometheus.GaugeVec
+	BlockHeight             prometheus.Gauge
+	ActiveValidators        prometheus.Gauge
+	LargestValShare         prometheus.Gauge
+	LargestEntShare         prometheus.Gauge
+	HaltCoeff               prometheus.Gauge
+	SafetyCoeff             prometheus.Gauge
+	GovTurnout              *prometheus.GaugeVec
+	GovQuorum               *prometheus.GaugeVec
+	GovSecondsRemaining     *prometheus.GaugeVec
+	ValMissedBlocks         *prometheus.GaugeVec
+	ValMissedBlocksInfo     *prometheus.GaugeVec
+	ValMissedRatio          *prometheus.GaugeVec
+	ValBlocksToJail         *prometheus.GaugeVec
+	ValSecondsToJail        *prometheus.GaugeVec
+	ValAtRiskPower          *prometheus.GaugeVec
+	SlashingParam           *prometheus.GaugeVec
+	ChainBlockTime          prometheus.Gauge
+	ValJailed               *prometheus.GaugeVec
+	ValInfo                 *prometheus.GaugeVec
+	EntityShare             *prometheus.GaugeVec
+	GovProposalInfo         *prometheus.GaugeVec
+	GovProposalQuorum       *prometheus.GaugeVec
+	GovProposalTally        *prometheus.GaugeVec
+	GovEntityVote           *prometheus.GaugeVec
+	GovProposalVetoRatio    *prometheus.GaugeVec
+	GovProposalQuorumMet    *prometheus.GaugeVec
+	GovProposalVetoState    *prometheus.GaugeVec
+	GovEntityVetoCapability *prometheus.GaugeVec
+	GovNonVoterPower        *prometheus.GaugeVec
+	GovWindow               *prometheus.GaugeVec
+	GovParticipationCount   *prometheus.GaugeVec
+	GovVetoThreshold        prometheus.Gauge
+	EntityCanVetoAlone      *prometheus.GaugeVec
+	AnyEntityCanVeto        prometheus.Gauge
+	VetoPowerNeeded         prometheus.Gauge
+	GovQuorumBuffer         *prometheus.GaugeVec
+	GovQuorumTarget         *prometheus.GaugeVec
+	UpgradeHeight           *prometheus.GaugeVec
+	BondedTokens            prometheus.Gauge
+	GovAttributionComplete  *prometheus.GaugeVec
+	EndpointInfo            *prometheus.GaugeVec
+	GovProposalLive         *prometheus.GaugeVec
+	SectionSuccess          *prometheus.GaugeVec
 }
 
 func NewMetrics() *Metrics {
@@ -226,8 +214,8 @@ func NewMetrics() *Metrics {
 		}, []string{"entity", "validators"}),
 		GovProposalInfo: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "validator_health_governance_proposal_info",
-			Help: "Final turnout ratio for a proposal, labeled with title and outcome.",
-		}, []string{"proposal_id", "title", "status"}),
+			Help: "Current or final turnout ratio for a proposal, labeled with title, status, and selector text.",
+		}, []string{"proposal_id", "title", "status", "selector"}),
 		GovProposalQuorum: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "validator_health_governance_proposal_quorum",
 			Help: "Quorum requirement for a proposal (0-1).",
@@ -238,16 +226,28 @@ func NewMetrics() *Metrics {
 		}, []string{"proposal_id", "option"}),
 		GovEntityVote: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "validator_health_governance_entity_vote_power",
-			Help: "Voting power per entity on a proposal, labeled with the option chosen.",
+			Help: "Attributed validator voting power per entity and vote option as a share of bonded power.",
 		}, []string{"proposal_id", "entity", "option"}),
+		GovProposalVetoRatio: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_governance_proposal_veto_ratio",
+			Help: "Authoritative NoWithVeto share of all votes cast on a proposal (0-1).",
+		}, []string{"proposal_id"}),
+		GovProposalQuorumMet: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_governance_proposal_quorum_met",
+			Help: "1 when proposal turnout is at or above the on-chain quorum, 0 otherwise.",
+		}, []string{"proposal_id"}),
+		GovProposalVetoState: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_governance_proposal_veto_state",
+			Help: "Proposal veto state: -1 quorum not met, 0 quorum met below veto threshold, 1 quorum met above veto threshold.",
+		}, []string{"proposal_id"}),
+		GovEntityVetoCapability: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_governance_entity_veto_capability_ratio",
+			Help: "Actual or hypothetical share of votes attributable to an entity that is individually sufficient to veto, labeled actual or potential. Potential assumes the entity casts or changes all attributed validator power to NoWithVeto now and no later dilution.",
+		}, []string{"proposal_id", "entity", "capability"}),
 		GovNonVoterPower: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "validator_health_governance_non_voter_power_ratio",
 			Help: "Share of bonded stake held by entities that did not vote on a proposal (0-1).",
 		}, []string{"proposal_id", "entity"}),
-		GovTurnoutTimeline: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "validator_health_governance_turnout_by_day",
-			Help: "Cumulative turnout ratio at each calendar date of the voting window (0-1).",
-		}, []string{"proposal_id", "date", "unixtime"}),
 		GovWindow: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "validator_health_governance_voting_window_seconds",
 			Help: "Unix timestamps for the start and end of a proposal's voting window.",
@@ -258,19 +258,19 @@ func NewMetrics() *Metrics {
 		}, []string{"proposal_id", "status"}),
 		GovVetoThreshold: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "validator_health_governance_veto_threshold",
-			Help: "On-chain veto threshold as a fraction of non-abstain votes cast (0-1).",
+			Help: "On-chain veto threshold as a fraction of all votes cast (0-1).",
 		}),
 		EntityCanVetoAlone: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "validator_health_entity_can_veto_alone",
-			Help: "1 if this entity alone could veto a typical proposal, 0 otherwise.",
+			Help: "1 if this entity's bonded voting-power share is strictly greater than the on-chain veto threshold, 0 otherwise.",
 		}, []string{"entity"}),
 		AnyEntityCanVeto: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "validator_health_any_entity_can_veto_alone",
-			Help: "1 if at least one entity could unilaterally veto a typical proposal, 0 if none can.",
+			Help: "1 if at least one entity holds enough bonded voting power to veto even at full turnout, 0 if none does.",
 		}),
 		VetoPowerNeeded: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "validator_health_veto_power_needed_ratio",
-			Help: "Share of bonded stake a single entity needs to veto alone at observed turnout (0-1).",
+			Help: "Bonded voting-power share a single entity must strictly exceed to veto even at full turnout (0-1).",
 		}),
 		GovQuorumBuffer: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "validator_health_governance_quorum_buffer",
@@ -290,7 +290,7 @@ func NewMetrics() *Metrics {
 		}),
 		GovAttributionComplete: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "validator_health_governance_vote_attribution_complete",
-			Help: "1 when per-voter attribution for a proposal is trustworthy, 0 when no endpoint could serve its vote transactions.",
+			Help: "1 when current validator votes for a live proposal were available for entity attribution, 0 otherwise.",
 		}, []string{"proposal_id"}),
 		EndpointInfo: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "validator_health_collector_endpoint_info",
@@ -335,8 +335,11 @@ func (m *Metrics) Describe(ch chan<- *prometheus.Desc) {
 	m.GovProposalQuorum.Describe(ch)
 	m.GovProposalTally.Describe(ch)
 	m.GovEntityVote.Describe(ch)
+	m.GovProposalVetoRatio.Describe(ch)
+	m.GovProposalQuorumMet.Describe(ch)
+	m.GovProposalVetoState.Describe(ch)
+	m.GovEntityVetoCapability.Describe(ch)
 	m.GovNonVoterPower.Describe(ch)
-	m.GovTurnoutTimeline.Describe(ch)
 	m.GovWindow.Describe(ch)
 	m.GovParticipationCount.Describe(ch)
 	m.GovVetoThreshold.Describe(ch)
@@ -381,8 +384,11 @@ func (m *Metrics) Collect(ch chan<- prometheus.Metric) {
 	m.GovProposalQuorum.Collect(ch)
 	m.GovProposalTally.Collect(ch)
 	m.GovEntityVote.Collect(ch)
+	m.GovProposalVetoRatio.Collect(ch)
+	m.GovProposalQuorumMet.Collect(ch)
+	m.GovProposalVetoState.Collect(ch)
+	m.GovEntityVetoCapability.Collect(ch)
 	m.GovNonVoterPower.Collect(ch)
-	m.GovTurnoutTimeline.Collect(ch)
 	m.GovWindow.Collect(ch)
 	m.GovParticipationCount.Collect(ch)
 	m.GovVetoThreshold.Collect(ch)
@@ -406,16 +412,11 @@ type Collector struct {
 	resolver   *endpoints.Resolver
 	entityMap  map[string]string
 	metrics    *Metrics
-	mu         sync.RWMutex
 
-	govBackfiller           *GovBackfiller
-	historicalProposalCount int
+	proposalHistoryWindow time.Duration
 
 	lastSlashingParams *SlashingParams
 	lastBlockTime      float64
-	trackedProposals   map[string]bool
-	observedTurnouts   map[string]float64
-	lastQuorum         float64
 
 	// Previous snapshot for detecting changes
 	prevValidators map[string]bool // operator_address -> present
@@ -426,22 +427,27 @@ type Collector struct {
 // start of every collection cycle.
 func New(resolver *endpoints.Resolver, entityMap map[string]string) *Collector {
 	return &Collector{
-		restClient:              NewRESTClient(),
-		rpcClient:               NewRPCClient(),
-		resolver:                resolver,
-		entityMap:               entityMap,
-		metrics:                 NewMetrics(),
-		govBackfiller:           NewGovBackfiller(),
-		historicalProposalCount: 6,
-		trackedProposals:        make(map[string]bool),
-		observedTurnouts:        make(map[string]float64),
-		prevValidators:          make(map[string]bool),
-		firstRun:                true,
+		restClient:            NewRESTClient(),
+		rpcClient:             NewRPCClient(),
+		resolver:              resolver,
+		entityMap:             entityMap,
+		metrics:               NewMetrics(),
+		proposalHistoryWindow: DefaultProposalHistoryWindow,
+		prevValidators:        make(map[string]bool),
+		firstRun:              true,
 	}
 }
 
-// resolveEndpoints re-probes the candidate endpoints and points the REST client,
-// the CometBFT queries, and the governance backfiller at the healthy ones.
+// SetProposalHistoryWindow sets the maximum age of closed proposals exported to
+// the dashboard. Live proposals are always included.
+func (c *Collector) SetProposalHistoryWindow(window time.Duration) {
+	if window > 0 {
+		c.proposalHistoryWindow = window
+	}
+}
+
+// resolveEndpoints re-probes the candidate endpoints and points the REST and
+// CometBFT clients at healthy nodes.
 //
 // This runs once per collection cycle rather than per request: an hourly poll
 // should read a consistent view of the chain, and re-probing 30-odd endpoints on
@@ -461,14 +467,12 @@ func (c *Collector) resolveEndpoints() error {
 
 	c.restClient.SetEndpoints(res.RESTAddresses)
 	c.rpcClient.SetEndpoints(res.RPCAddresses)
-	c.govBackfiller.SetEndpoints(res.RPCAddresses)
 
 	// Republish from scratch so a rotation does not leave the previous endpoint
 	// reporting as current alongside the new one.
 	c.metrics.EndpointInfo.Reset()
 	c.publishEndpoint("rest", res.REST, c.restClient.BaseURL())
 	c.publishEndpoint("rpc", res.RPC, c.rpcClient.BaseURL())
-	c.publishEndpoint("txsearch", res.RPC, c.govBackfiller.RPCURL())
 
 	return nil
 }
@@ -575,14 +579,16 @@ func (c *Collector) CollectSnapshot() error {
 	// cycle's values in place lets time-bound alerts keep firing on a snapshot
 	// nobody can refresh. The cycle also stops reporting itself successful at the
 	// end, so CollectorStale eventually surfaces the blindness.
-	activeProps, govErr := c.restClient.QueryActiveProposals()
+	proposalCutoff := time.Now().Add(-c.proposalHistoryWindow)
+	activeProps, recentClosedProps, govErr := c.restClient.QueryRelevantProposals(proposalCutoff)
 	if govErr != nil {
 		log.Printf("WARN: Governance query failed; live proposal series remain retired: %v", govErr)
 	}
-	govQuorum, _, govVeto, _ := c.restClient.QueryGovParams()
-	c.metrics.GovVetoThreshold.Set(govVeto)
-	if govQuorum > 0 {
-		c.lastQuorum = govQuorum
+	govQuorum, _, govVeto, govParamsErr := c.restClient.QueryGovParams()
+	if govParamsErr != nil {
+		log.Printf("WARN: Governance params query failed; retaining the previous veto threshold: %v", govParamsErr)
+	} else {
+		c.metrics.GovVetoThreshold.Set(govVeto)
 	}
 
 	// 5. Slashing parameters and block interval. Both drive the jail estimate,
@@ -696,38 +702,25 @@ func (c *Collector) CollectSnapshot() error {
 		entityPowerShare[e.name] = share
 	}
 
-	// Unilateral veto capability.
-	//
-	// The veto threshold is a share of votes CAST, not of bonded stake, so an
-	// entity's raw voting-power share is not directly comparable to 33.4%.
-	//
-	// An entity casting a veto also adds its own stake to the denominator. With
-	// C the entity's stake, O the stake everyone else casts, and v the veto
-	// threshold, a veto succeeds when:
-	//
-	//     C / (C + O) > v      =>      C > O * v / (1-v)
-	//
-	// At v = 0.334 the multiplier is ~0.5, so an entity needs roughly half of
-	// whatever everyone else votes. Turnout is what makes this reachable: when
-	// only ~23% of stake participates, ~12% is enough to veto. The same entity
-	// would need the full 33.4% only if every token voted.
+	// Turnout-independent unilateral veto capability. The SDK compares
+	// NoWithVeto voting power to all voting power that was cast and uses a strict
+	// greater-than check. Comparing an entity's bonded share to the live threshold
+	// answers the stronger operational question: can it veto even if every bonded
+	// token votes? Lower-turnout scenarios are intentionally not labeled as an
+	// entity holding unilateral veto power.
 	c.metrics.EntityCanVetoAlone.Reset()
-	othersTurnout := c.referenceTurnout()
 	anyCanVeto := 0.0
-	if govVeto > 0 && govVeto < 1 && othersTurnout > 0 {
-		vetoPowerNeeded := othersTurnout * govVeto / (1 - govVeto)
-		c.metrics.VetoPowerNeeded.Set(vetoPowerNeeded)
+	if govParamsErr == nil && govVeto > 0 && govVeto < 1 {
+		c.metrics.VetoPowerNeeded.Set(govVeto)
 		for _, e := range entities {
 			share := e.power / totalBonded
-			if share <= vetoPowerNeeded {
+			if !hasTurnoutIndependentVetoPower(share, govVeto) {
 				continue
 			}
 			c.metrics.EntityCanVetoAlone.WithLabelValues(e.name).Set(1)
 			anyCanVeto = 1
-			// Resulting veto share if this entity vetoed at that turnout.
-			resulting := share / (share + othersTurnout)
-			log.Printf("VETO CAPABILITY: %s holds %.2f%% of bonded stake; needs %.2f%% at %.1f%% turnout. A veto would be %.1f%% of votes cast, above the %.1f%% threshold.",
-				e.name, share*100, vetoPowerNeeded*100, othersTurnout*100, resulting*100, govVeto*100)
+			log.Printf("VETO CAPABILITY: %s holds %.2f%% of bonded voting power, above the %.1f%% on-chain threshold; it can veto even at full turnout.",
+				e.name, share*100, govVeto*100)
 		}
 	}
 	c.metrics.AnyEntityCanVeto.Set(anyCanVeto)
@@ -776,9 +769,9 @@ func (c *Collector) CollectSnapshot() error {
 	// page the ecosystem about a vote that has already ended and can no longer be
 	// influenced.
 	//
-	// Historical series for closed proposals live in analyzeProposals and are kept
-	// deliberately, because the dashboard charts past turnout. The alerts are gated
-	// on validator_health_governance_proposal_live so that history cannot page.
+	// Closed proposal summaries are refreshed separately inside the bounded history
+	// window. Prometheus retains their prior samples, while alerts are gated on
+	// validator_health_governance_proposal_live so history cannot page.
 	for _, p := range activeProps {
 		endTime, err := time.Parse(time.RFC3339, p.VotingEndTime)
 		if err == nil {
@@ -914,26 +907,21 @@ func (c *Collector) CollectSnapshot() error {
 	c.firstRun = false
 	c.prevValidators = currentSet
 
-	// Proposal analysis runs last because it is by far the most expensive step:
-	// it reads paginated tx_search results per proposal. Everything above is a
-	// handful of requests, so keeping governance at the end means the headline
-	// concentration and coefficient metrics publish within seconds even when the
-	// governance backfill is slow or an endpoint is rate limiting us.
-	//
-	// It also needs the block interval measured above to timestamp votes.
-	//
-	// Selection is dynamic: every currently-voting proposal, plus the most recent
-	// closed ones for historical reference. A closed proposal's vote history is
-	// immutable, so it is analyzed once and then skipped on later cycles.
+	// Proposal analysis runs last. Aggregate state for live and recent closed
+	// proposals comes from lightweight REST summaries and tallies. Only live
+	// proposals request current vote records for optional entity attribution; no
+	// transaction-history scan or archive RPC dependency is involved.
 	var analysisErr error
-	if govErr == nil {
+	if govErr == nil && govParamsErr == nil {
 		if bondedTokens > 0 {
-			analysisErr = c.analyzeProposals(activeProps, validators, bondedTokens, govQuorum)
+			analysisErr = c.analyzeProposals(
+				activeProps, recentClosedProps, validators, bondedTokens, govQuorum, govVeto,
+			)
 		} else if len(activeProps) > 0 {
 			analysisErr = errors.New("cannot analyze active proposals without the bonded staking pool")
 		}
 	}
-	governanceErr := errors.Join(govErr, analysisErr)
+	governanceErr := errors.Join(govErr, govParamsErr, analysisErr)
 	c.metrics.SectionSuccess.WithLabelValues("governance").Set(boolGauge(governanceErr == nil))
 
 	// A partial snapshot is published, because concentration and signing metrics are
@@ -951,11 +939,8 @@ func (c *Collector) CollectSnapshot() error {
 }
 
 // retireLiveProposalSeries drops every governance series that is only meaningful
-// while a proposal's voting period is open.
-//
-// Kept deliberately narrow. Series that describe a finished vote, such as the
-// tally, per-entity votes and the turnout timeline, are what the dashboard charts
-// historically and are not touched here.
+// while a proposal's voting period is open. Prometheus retains old samples for
+// historical range queries, but they disappear from current alert evaluation.
 func (c *Collector) retireLiveProposalSeries() {
 	c.metrics.GovProposalLive.Reset()
 	c.metrics.GovSecondsRemaining.Reset()
@@ -963,100 +948,71 @@ func (c *Collector) retireLiveProposalSeries() {
 	c.metrics.GovQuorum.Reset()
 }
 
-// retireProposalAnalysisSeries removes the dynamic analysis for one live
-// proposal before that proposal is refreshed.
-//
-// Analysis series use the same metric families for live and historical
-// proposals, so resetting the whole vectors would erase the closed-proposal
-// history used by the dashboard. Deleting only this proposal prevents an old
-// quorum buffer, tally, or voter breakdown from surviving a failed refresh while
-// leaving every other proposal intact.
-func (c *Collector) retireProposalAnalysisSeries(id string) {
-	labels := prometheus.Labels{"proposal_id": id}
-	c.metrics.GovProposalInfo.DeletePartialMatch(labels)
-	c.metrics.GovProposalQuorum.DeletePartialMatch(labels)
-	c.metrics.GovProposalTally.DeletePartialMatch(labels)
-	c.metrics.GovEntityVote.DeletePartialMatch(labels)
-	c.metrics.GovNonVoterPower.DeletePartialMatch(labels)
-	c.metrics.GovTurnoutTimeline.DeletePartialMatch(labels)
-	c.metrics.GovWindow.DeletePartialMatch(labels)
-	c.metrics.GovParticipationCount.DeletePartialMatch(labels)
-	c.metrics.GovAttributionComplete.DeletePartialMatch(labels)
-	c.metrics.GovQuorumBuffer.DeletePartialMatch(labels)
-	c.metrics.GovQuorumTarget.DeletePartialMatch(labels)
-
-	// The alert gate, turnout, and quorum are analysis-derived too: they stay
-	// absent until everything above has been republished successfully. Time
-	// remaining comes directly from the confirmed-open proposal record and cannot
-	// alert without the gate.
-	c.metrics.GovProposalLive.DeleteLabelValues(id)
-	c.metrics.GovTurnout.DeleteLabelValues(id)
-	c.metrics.GovQuorum.DeleteLabelValues(id)
+// resetProposalAnalysisSeries makes the collector's current metric set exactly
+// match the live proposals and retention-bounded closed proposals found this
+// cycle. Prometheus and Mimir keep prior samples according to their own retention
+// policies, so no historical data is deleted by resetting the in-process gauges.
+func (c *Collector) resetProposalAnalysisSeries() {
+	c.metrics.GovProposalInfo.Reset()
+	c.metrics.GovProposalQuorum.Reset()
+	c.metrics.GovProposalTally.Reset()
+	c.metrics.GovEntityVote.Reset()
+	c.metrics.GovProposalVetoRatio.Reset()
+	c.metrics.GovProposalQuorumMet.Reset()
+	c.metrics.GovProposalVetoState.Reset()
+	c.metrics.GovEntityVetoCapability.Reset()
+	c.metrics.GovNonVoterPower.Reset()
+	c.metrics.GovWindow.Reset()
+	c.metrics.GovParticipationCount.Reset()
+	c.metrics.GovAttributionComplete.Reset()
+	c.metrics.GovQuorumBuffer.Reset()
+	c.metrics.GovQuorumTarget.Reset()
+	c.retireLiveProposalSeries()
 }
 
-// analyzeProposals discovers which proposals to report on, then publishes
-// per-entity vote data and turnout timelines for each.
-//
-// Selection is dynamic: anything currently in its voting period is always
-// analyzed and refreshed every cycle, and the most recent closed proposals are
-// analyzed once for historical comparison.
+// analyzeProposals publishes lightweight aggregate state for every live proposal
+// and each closed proposal inside the configured history window. Current vote
+// records are requested only for live proposals, where entity-level action is
+// still possible.
 func (c *Collector) analyzeProposals(
 	activeProps []Proposal,
+	recentClosedProps []Proposal,
 	validators []Validator,
-	bondedTokens, quorum float64,
+	bondedTokens, quorum, vetoThreshold float64,
 ) error {
-	type target struct {
-		prop   Proposal
-		isLive bool
-	}
-	var targets []target
+	c.resetProposalAnalysisSeries()
+
+	var targets []Proposal
 	seen := make(map[string]bool)
 	var liveErrors []error
 
-	// Live proposals first. These change while voting is open, so they are
-	// always re-analyzed.
-	for _, p := range activeProps {
-		targets = append(targets, target{prop: p, isLive: true})
-		seen[p.ID] = true
+	for _, proposal := range activeProps {
+		targets = append(targets, proposal)
+		seen[proposal.ID] = true
 	}
-
-	// Recent closed proposals for historical reference.
-	recent, err := c.restClient.QueryRecentProposals(c.historicalProposalCount)
-	if err != nil {
-		log.Printf("WARN: recent proposal discovery failed: %v", err)
-	}
-	for _, p := range recent {
-		if seen[p.ID] || p.Status == statusVotingPeriod {
+	for _, proposal := range recentClosedProps {
+		if seen[proposal.ID] {
 			continue
 		}
-		// Deposit-period proposals have no vote history worth charting.
-		if p.Status == statusDepositPeriod {
-			continue
-		}
-		targets = append(targets, target{prop: p, isLive: false})
-		seen[p.ID] = true
+		targets = append(targets, proposal)
+		seen[proposal.ID] = true
 	}
 
-	for _, t := range targets {
-		// A closed proposal's tally and vote history never change, so analyzing
-		// it once is enough. Live proposals are refreshed every cycle.
-		if !t.isLive && c.trackedProposals[t.prop.ID] {
-			continue
-		}
-		id := t.prop.ID
-		prop := &t.prop
-		if t.isLive {
-			// A live proposal changes every cycle. Clear its previous analysis before
-			// attempting the refresh so a failed endpoint cannot leave old quorum or
-			// voter data looking current.
-			c.retireProposalAnalysisSeries(id)
-		}
-
-		analysis, err := c.govBackfiller.AnalyzeProposal(prop, validators, c.entityMap,
-			bondedTokens, quorum, c.blockIntervalOrDefault(), c.restClient.QueryLiveTally)
+	for i := range targets {
+		proposal := &targets[i]
+		id := proposal.ID
+		analysis, err := analyzeProposal(
+			proposal,
+			validators,
+			c.entityMap,
+			bondedTokens,
+			quorum,
+			c.restClient.QueryLiveTally,
+			c.restClient.QueryProposalVotes,
+		)
 		if err != nil {
 			log.Printf("WARN: proposal %s analysis failed: %v", id, err)
-			if t.isLive {
+			if proposal.Status == statusVotingPeriod {
 				liveErrors = append(liveErrors, fmt.Errorf("active proposal %s: %w", id, err))
 			}
 			continue
@@ -1067,16 +1023,22 @@ func (c *Collector) analyzeProposals(
 			title = title[:60]
 		}
 
-		c.metrics.GovProposalInfo.WithLabelValues(id, title, analysis.Status).Set(analysis.FinalTurnout)
+		selectorStatus := analysis.Status
+		if analysis.IsLive {
+			selectorStatus = "LIVE"
+		}
+		selector := fmt.Sprintf("#%s | %s | %s", id, selectorStatus, title)
+		c.metrics.GovProposalInfo.WithLabelValues(id, title, analysis.Status, selector).Set(analysis.FinalTurnout)
 		c.metrics.GovProposalQuorum.WithLabelValues(id).Set(quorum)
 
-		// Whether per-voter attribution can be trusted for this proposal. The
-		// tally and turnout above stay valid either way, because they come from
-		// the chain's own tally rather than from indexed transactions.
-		c.metrics.GovAttributionComplete.WithLabelValues(id).Set(boolGauge(analysis.AttributionComplete))
-		if !analysis.AttributionComplete {
-			log.Printf("WARN: proposal %s has a tally but no endpoint could attribute its votes, "+
-				"so per-entity vote breakdowns are omitted for it", id)
+		// Entity attribution is actionable only while voting is open. A failure of
+		// the current-votes endpoint does not invalidate the authoritative tally.
+		if analysis.IsLive {
+			c.metrics.GovAttributionComplete.WithLabelValues(id).Set(boolGauge(analysis.AttributionComplete))
+			if !analysis.AttributionComplete {
+				log.Printf("WARN: proposal %s current votes are unavailable, "+
+					"so per-entity vote breakdowns are omitted", id)
+			}
 		}
 
 		// Desired state: turnout should clear quorum by at least 10 percentage
@@ -1084,19 +1046,6 @@ func (c *Collector) analyzeProposals(
 		// governance change to quorum automatically retargets the buffer.
 		c.metrics.GovQuorumTarget.WithLabelValues(id).Set(quorum + QuorumBufferPoints)
 		c.metrics.GovQuorumBuffer.WithLabelValues(id).Set(analysis.FinalTurnout - quorum)
-
-		// Feed observed turnout into the veto-capability denominator.
-		//
-		// Only completed proposals count. A proposal still in its voting period
-		// has partial turnout that climbs toward its final value, and it is
-		// re-analyzed every cycle, so recording it would both understate turnout
-		// and add one sample per cycle until voting closes. Keyed by proposal so
-		// a re-analysis replaces rather than duplicates.
-		if !analysis.IsLive {
-			c.mu.Lock()
-			c.observedTurnouts[id] = analysis.FinalTurnout
-			c.mu.Unlock()
-		}
 
 		// Tally breakdown as a share of bonded stake.
 		//
@@ -1109,33 +1058,38 @@ func (c *Collector) analyzeProposals(
 		c.metrics.GovProposalTally.WithLabelValues(id, "Abstain").Set(analysis.Abstain / bondedTokens)
 		c.metrics.GovProposalTally.WithLabelValues(id, "No with veto").Set(analysis.Veto / bondedTokens)
 
-		// Aggregate votes by entity so one entity's validators appear as one row.
-		type entityVote struct {
-			power  float64
-			option string
-		}
-		byEntity := make(map[string]*entityVote)
-		for _, v := range analysis.Voted {
-			e, ok := byEntity[v.Entity]
-			if !ok {
-				byEntity[v.Entity] = &entityVote{power: v.VotingPower, option: v.Option}
-				continue
-			}
-			e.power += v.VotingPower
-		}
-		for entity, ev := range byEntity {
-			c.metrics.GovEntityVote.WithLabelValues(id, entity, ev.option).Set(ev.power / bondedTokens)
+		vetoRatio, quorumMet, vetoState, capabilities := analyzeProposalVeto(analysis, vetoThreshold)
+		c.metrics.GovProposalVetoRatio.WithLabelValues(id).Set(vetoRatio)
+		c.metrics.GovProposalQuorumMet.WithLabelValues(id).Set(boolGauge(quorumMet))
+		c.metrics.GovProposalVetoState.WithLabelValues(id).Set(vetoState)
+		for _, capability := range capabilities {
+			c.metrics.GovEntityVetoCapability.WithLabelValues(
+				id, capability.Entity, capability.Kind,
+			).Set(capability.Ratio)
 		}
 
-		// Non-voters aggregated by entity, largest first. These are the entities
-		// whose absence moved turnout toward or below quorum.
+		type entityOption struct {
+			entity string
+			option string
+		}
+		byEntity := make(map[string]float64)
+		byEntityOption := make(map[entityOption]float64)
+		for _, v := range analysis.Voted {
+			byEntity[v.Entity] += v.VotingPower
+			for option, weight := range voteWeights(v) {
+				byEntityOption[entityOption{entity: v.Entity, option: option}] += v.VotingPower * weight
+			}
+		}
+		for key, power := range byEntityOption {
+			c.metrics.GovEntityVote.WithLabelValues(id, key.entity, key.option).Set(power / bondedTokens)
+		}
+
 		nonVoterByEntity := make(map[string]float64)
 		for _, v := range analysis.NonVoters {
 			nonVoterByEntity[v.Entity] += v.VotingPower
 		}
 		for entity, power := range nonVoterByEntity {
 			share := power / bondedTokens
-			// Skip dust entities so the panel stays readable.
 			if share < 0.0005 {
 				continue
 			}
@@ -1145,98 +1099,61 @@ func (c *Collector) analyzeProposals(
 		c.metrics.GovParticipationCount.WithLabelValues(id, "Voted").Set(float64(len(byEntity)))
 		c.metrics.GovParticipationCount.WithLabelValues(id, "Did not vote").Set(float64(len(nonVoterByEntity)))
 
-		// Turnout timeline bucketed by calendar date of the voting window.
+		// Grafana uses the normal hourly samples of proposal_info to draw the
+		// prospective turnout timeline. The window bounds keep the chart focused on
+		// the period when an outcome could still be influenced.
 		c.metrics.GovWindow.WithLabelValues(id, "start").Set(float64(analysis.VotingStart.Unix()))
 		c.metrics.GovWindow.WithLabelValues(id, "end").Set(float64(analysis.VotingEnd.Unix()))
 
-		dailyMax := make(map[string]float64)
-		for _, pt := range analysis.TurnoutTimeline {
-			key := pt.Time.UTC().Format("2006-01-02")
-			if pt.Cumulative > dailyMax[key] {
-				dailyMax[key] = pt.Cumulative
-			}
-		}
-		// Walk the window one calendar day at a time, carrying the running total
-		// forward so the curve stays monotonic across days with no votes.
-		var running float64
-		endDay := analysis.VotingEnd.UTC().Truncate(24 * time.Hour)
-		for d := analysis.VotingStart.UTC().Truncate(24 * time.Hour); !d.After(endDay); d = d.AddDate(0, 0, 1) {
-			key := d.Format("2006-01-02")
-			if v, ok := dailyMax[key]; ok && v > running {
-				running = v
-			}
-			c.metrics.GovTurnoutTimeline.WithLabelValues(
-				id, key, strconv.FormatInt(d.Unix(), 10),
-			).Set(running)
-		}
-
-		if t.isLive {
+		if analysis.IsLive {
 			// Live proposal records expose a zeroed final_tally_result. Publish the
 			// authoritative turnout calculated from QueryLiveTally here, alongside
 			// the quorum used by the same analysis, then publish the alert gate last.
 			c.metrics.GovTurnout.WithLabelValues(id).Set(analysis.FinalTurnout)
 			c.metrics.GovQuorum.WithLabelValues(id).Set(quorum)
 			c.metrics.GovProposalLive.WithLabelValues(id).Set(1)
-		} else {
-			// Mark a proposal immutable only after analyzing its final closed state.
-			// Recording it while live would skip the one final refresh after voting
-			// closes and leave the dashboard with a VOTING_PERIOD status and partial
-			// turnout forever.
-			c.trackedProposals[id] = true
 		}
 
-		liveTag := ""
-		if t.isLive {
-			liveTag = " [voting open]"
+		if analysis.IsLive && analysis.AttributionComplete {
+			log.Printf("Proposal %s (%s) [voting open]: turnout %.2f%% vs quorum %.0f%%, "+
+				"%d entities voted, %d did not",
+				id, analysis.Status, analysis.FinalTurnout*100, quorum*100, len(byEntity), len(nonVoterByEntity))
+			continue
 		}
-		log.Printf("Proposal %s (%s)%s: turnout %.2f%% vs quorum %.0f%%, %d entities voted, %d did not",
-			id, analysis.Status, liveTag, analysis.FinalTurnout*100, quorum*100, len(byEntity), len(nonVoterByEntity))
+		log.Printf("Proposal %s (%s): turnout %.2f%% vs quorum %.0f%%",
+			id, analysis.Status, analysis.FinalTurnout*100, quorum*100)
 	}
 
 	return errors.Join(liveErrors...)
 }
 
-// referenceTurnout returns the participation level used as the denominator for
-// veto-capability math.
-//
-// This uses the HIGHEST turnout observed on a completed proposal, not the
-// median. Veto capability is a claim about what an entity could do on a real
-// proposal, so it should hold against the best-participation case. Using a
-// median makes the answer swing with whichever low-turnout proposals happen to
-// be in the sample, and would flag entities that could only veto if turnout
-// collapsed. An entity that clears the bar at peak turnout clears it at every
-// lower turnout too, so this is the conservative choice.
-//
-// The quorum requirement is the floor: a proposal below quorum fails outright,
-// so nobody needs to veto it.
-func (c *Collector) referenceTurnout() float64 {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	highest := 0.0
-	for _, v := range c.observedTurnouts {
-		if v > highest {
-			highest = v
-		}
-	}
-	if highest < c.lastQuorum {
-		return c.lastQuorum
-	}
-	return highest
+func hasTurnoutIndependentVetoPower(entityShare, vetoThreshold float64) bool {
+	return vetoThreshold > 0 && vetoThreshold < 1 && entityShare > vetoThreshold
 }
 
 // Run starts the polling loop. It runs one collection immediately, then on the given interval.
 func (c *Collector) Run(interval time.Duration) {
+	if interval <= 0 {
+		log.Printf("Collection loop disabled because interval is %v", interval)
+		return
+	}
+
 	// Run immediately on start
 	if err := c.CollectSnapshot(); err != nil {
 		log.Printf("Initial collection failed: %v", err)
 	}
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for range ticker.C {
+	for {
+		next := nextAlignedRun(time.Now(), interval)
+		log.Printf("Next snapshot collection scheduled for %s", next.Format(time.RFC3339))
+		timer := time.NewTimer(time.Until(next))
+		<-timer.C
 		if err := c.CollectSnapshot(); err != nil {
 			log.Printf("Collection failed: %v", err)
 		}
 	}
+}
+
+func nextAlignedRun(now time.Time, interval time.Duration) time.Time {
+	return now.Truncate(interval).Add(interval)
 }

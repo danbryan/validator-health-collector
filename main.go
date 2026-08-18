@@ -24,6 +24,11 @@ func main() {
 	entityMapPath := flag.String("entity-map", "entity.yaml", "Path to entity map YAML file")
 	listenAddr := flag.String("listen", ":9090", "HTTP listen address for /metrics")
 	pollInterval := flag.Duration("interval", 1*time.Hour, "Polling interval")
+	proposalHistory := flag.Duration(
+		"proposal-history",
+		collector.DefaultProposalHistoryWindow,
+		"Maximum age of closed proposals exported for dashboard history; live proposals are always included",
+	)
 	flag.Parse()
 
 	// The entity map is what turns per-validator power into per-operator power, so
@@ -57,6 +62,7 @@ func main() {
 	})
 
 	c := collector.New(resolver, em)
+	c.SetProposalHistoryWindow(*proposalHistory)
 
 	// Register metrics with Prometheus
 	prometheus.MustRegister(c.Metrics())
@@ -76,6 +82,7 @@ func main() {
 	logEndpointSource("REST", *restURL)
 	logEndpointSource("RPC", *rpcURL)
 	log.Printf("Poll interval: %v", *pollInterval)
+	log.Printf("Closed proposal history: %v", *proposalHistory)
 
 	server := &http.Server{
 		Addr:              *listenAddr,
