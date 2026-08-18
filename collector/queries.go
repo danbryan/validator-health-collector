@@ -200,16 +200,41 @@ func (c *RPCClient) MeasureBlockTime(sampleBlocks int64) (float64, error) {
 	return tLatest.Sub(tOld).Seconds() / float64(hLatest-hOld), nil
 }
 
-// QueryRecentProposals fetches the most recent N proposals plus any currently
-// in the voting period, so the dashboard selector reflects live chain state
-// instead of a hardcoded list.
-func (c *RESTClient) QueryRecentProposals(limit int) ([]Proposal, error) {
-	path := fmt.Sprintf("/cosmos/gov/v1/proposals?pagination.reverse=true&pagination.limit=%d", limit)
-	var resp ProposalsResponse
-	if err := c.get(path, &resp); err != nil {
-		return nil, fmt.Errorf("querying recent proposals: %w", err)
+// QueryRelevantProposals scans proposal summaries once and returns everything
+// currently in voting plus closed proposals whose voting window ended on or
+// after cutoff. This bounds dashboard history by time rather than an arbitrary
+// proposal count while avoiding a second governance-list scan.
+func (c *RESTClient) QueryRelevantProposals(cutoff time.Time) (active, recentClosed []Proposal, err error) {
+	var nextKey string
+	for {
+		path := "/cosmos/gov/v1/proposals?pagination.limit=100"
+		if nextKey != "" {
+			path += "&pagination.key=" + url.QueryEscape(nextKey)
+		}
+
+		var resp ProposalsResponse
+		if getErr := c.get(path, &resp); getErr != nil {
+			return nil, nil, fmt.Errorf("querying proposals: %w", getErr)
+		}
+		for _, proposal := range resp.Proposals {
+			switch proposal.Status {
+			case statusVotingPeriod:
+				active = append(active, proposal)
+			case statusDepositPeriod:
+				continue
+			default:
+				votingEnd, parseErr := time.Parse(time.RFC3339, proposal.VotingEndTime)
+				if parseErr == nil && !votingEnd.Before(cutoff) {
+					recentClosed = append(recentClosed, proposal)
+				}
+			}
+		}
+		if resp.Pagination.NextKey == "" || resp.Pagination.NextKey == nullNextKey {
+			break
+		}
+		nextKey = resp.Pagination.NextKey
 	}
-	return resp.Proposals, nil
+	return active, recentClosed, nil
 }
 
 // QueryLiveTally fetches the running tally for a proposal still in its voting
@@ -227,6 +252,51 @@ func (c *RESTClient) QueryLiveTally(id string) (float64, float64, float64, float
 	return yes, no, abstain, veto, nil
 }
 
+// QueryProposalVotes fetches the current vote record for each account on a live
+// proposal. Unlike tx_search, this does not download transaction history or
+// require an archive-indexed RPC node. Closed proposals normally return no rows
+// because the governance module removes vote records after finalization.
+func (c *RESTClient) QueryProposalVotes(id string) (map[string]GovVote, error) {
+	votes := make(map[string]GovVote)
+	var nextKey string
+	for {
+		path := fmt.Sprintf("/cosmos/gov/v1/proposals/%s/votes?pagination.limit=1000", id)
+		if nextKey != "" {
+			path += "&pagination.key=" + url.QueryEscape(nextKey)
+		}
+
+		var resp ProposalVotesResponse
+		if err := c.get(path, &resp); err != nil {
+			return nil, fmt.Errorf("querying current votes for proposal %s: %w", id, err)
+		}
+		for _, rawVote := range resp.Votes {
+			weights := make(map[string]float64, len(rawVote.Options))
+			for _, option := range rawVote.Options {
+				weight, parseErr := strconv.ParseFloat(option.Weight, 64)
+				if parseErr != nil || weight <= 0 {
+					continue
+				}
+				weights[normalizeVoteOption(option.Option)] += weight
+			}
+			if rawVote.Voter == "" || len(weights) == 0 {
+				continue
+			}
+			primary := "WEIGHTED"
+			if len(weights) == 1 {
+				for option := range weights {
+					primary = option
+				}
+			}
+			votes[rawVote.Voter] = GovVote{Option: primary, Options: weights}
+		}
+		if resp.Pagination.NextKey == "" || resp.Pagination.NextKey == nullNextKey {
+			break
+		}
+		nextKey = resp.Pagination.NextKey
+	}
+	return votes, nil
+}
+
 // QueryProposalByID fetches a single proposal by ID.
 func (c *RESTClient) QueryProposalByID(id string) (*Proposal, error) {
 	var resp ProposalResponse
@@ -234,35 +304,6 @@ func (c *RESTClient) QueryProposalByID(id string) (*Proposal, error) {
 		return nil, fmt.Errorf("querying proposal %s: %w", id, err)
 	}
 	return &resp.Proposal, nil
-}
-
-// QueryActiveProposals fetches proposals in voting period.
-func (c *RESTClient) QueryActiveProposals() ([]Proposal, error) {
-	var all []Proposal
-	var nextKey string
-
-	for {
-		path := "/cosmos/gov/v1/proposals?pagination.limit=100"
-		if nextKey != "" {
-			path += "&pagination.key=" + url.QueryEscape(nextKey)
-		}
-
-		var resp ProposalsResponse
-		if err := c.get(path, &resp); err != nil {
-			return nil, fmt.Errorf("querying proposals: %w", err)
-		}
-		// Filter client-side since the REST API status filter may not work
-		for _, p := range resp.Proposals {
-			if p.Status == statusVotingPeriod {
-				all = append(all, p)
-			}
-		}
-		if resp.Pagination.NextKey == "" || resp.Pagination.NextKey == nullNextKey {
-			break
-		}
-		nextKey = resp.Pagination.NextKey
-	}
-	return all, nil
 }
 
 // QueryGovParams fetches governance tallying parameters.

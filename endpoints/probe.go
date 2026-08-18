@@ -112,7 +112,7 @@ func getJSON(client *http.Client, url string, dst any) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
@@ -166,12 +166,9 @@ func ProbeREST(eps []Endpoint) []Candidate {
 	return cands
 }
 
-// ProbeRPC health checks CometBFT RPC endpoints and returns them ranked with the
-// deepest retained history first, then fastest.
-//
-// History depth is the primary sort key because the governance vote backfill
-// reads historical blocks through tx_search, and a recently-started node cannot
-// serve them.
+// ProbeRPC health checks CometBFT RPC endpoints and returns them ranked fastest
+// first. The collector reads only current state and a recent block-time sample,
+// so archive depth is not a dependency.
 func ProbeRPC(eps []Endpoint) []Candidate {
 	cands := probeAll(eps, func(ep Endpoint) Candidate {
 		c := Candidate{Endpoint: ep}
@@ -217,24 +214,7 @@ func ProbeRPC(eps []Endpoint) []Candidate {
 		if a.Healthy != b.Healthy {
 			return a.Healthy
 		}
-		// Deepest history first. A reported earliest height of 0 is treated as
-		// unknown rather than as a full archive, because providers were observed
-		// reporting 0 while pruning their transaction index.
-		ra, rb := historyRank(a), historyRank(b)
-		if ra != rb {
-			return ra < rb
-		}
 		return a.Latency < b.Latency
 	})
 	return cands
-}
-
-// historyRank orders RPC candidates by how much history they claim. Lower sorts
-// earlier. Endpoints reporting 0 are ranked behind those reporting a real
-// earliest height, since 0 has been observed on pruning nodes.
-func historyRank(c Candidate) int64 {
-	if c.EarliestHeight <= 0 {
-		return c.LatestHeight
-	}
-	return c.EarliestHeight
 }

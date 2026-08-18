@@ -12,14 +12,11 @@ import (
 	"github.com/danbryan/validator-health-collector/endpoints"
 )
 
-func analysisTestCollector(rpcURL string) *Collector {
+func analysisTestCollector(restURL string) *Collector {
 	return &Collector{
-		restClient:              NewRESTClient(),
-		metrics:                 NewMetrics(),
-		govBackfiller:           NewGovBackfiller(rpcURL),
-		historicalProposalCount: 6,
-		trackedProposals:        make(map[string]bool),
-		observedTurnouts:        make(map[string]float64),
+		restClient:            NewRESTClient(restURL),
+		metrics:               NewMetrics(),
+		proposalHistoryWindow: DefaultProposalHistoryWindow,
 	}
 }
 
@@ -71,15 +68,15 @@ func TestCollectSnapshotRetiresLiveGateBeforeEndpointFailure(t *testing.T) {
 	}
 }
 
-func TestAnalyzeProposalsRetiresStaleLiveMetricsWhenAnalysisFails(t *testing.T) {
+func TestAnalyzeProposalsRetiresStaleMetricsWhenLiveTallyFails(t *testing.T) {
 	t.Parallel()
 
-	failedRPC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	failedREST := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)
 	}))
-	defer failedRPC.Close()
+	defer failedREST.Close()
 
-	c := analysisTestCollector(failedRPC.URL)
+	c := analysisTestCollector(failedREST.URL)
 	id := "1051"
 
 	// Simulate values left by the previous successful cycle. In particular, the
@@ -89,9 +86,9 @@ func TestAnalyzeProposalsRetiresStaleLiveMetricsWhenAnalysisFails(t *testing.T) 
 	c.metrics.GovQuorumBuffer.WithLabelValues(id).Set(-0.2)
 	c.metrics.GovEntityVote.WithLabelValues(id, "stale-entity", "YES").Set(0.1)
 
-	err := c.analyzeProposals([]Proposal{liveProposalForTest()}, nil, 1000, 0.4)
+	err := c.analyzeProposals([]Proposal{liveProposalForTest()}, nil, nil, 1000, 0.4, 0.334)
 	if err == nil {
-		t.Fatal("analyzeProposals() succeeded even though the live analysis endpoint failed")
+		t.Fatal("analyzeProposals() succeeded even though the live tally endpoint failed")
 	}
 	if got := testutil.ToFloat64(c.metrics.GovProposalLive.WithLabelValues(id)); got != 0 {
 		t.Errorf("proposal_live = %v, want the failed proposal gate retired", got)
@@ -107,29 +104,31 @@ func TestAnalyzeProposalsRetiresStaleLiveMetricsWhenAnalysisFails(t *testing.T) 
 	}
 }
 
-func TestAnalyzeProposalsPublishesLiveGateOnlyAfterSuccessfulAnalysis(t *testing.T) {
+func TestAnalyzeProposalsPublishesLiveGateAfterAggregateRefresh(t *testing.T) {
 	t.Parallel()
 
-	indexedRPC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"result":{"total_count":"0","txs":[]}}`))
+	rest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/cosmos/gov/v1/proposals/1051/tally":
+			_, _ = w.Write([]byte(`{"tally":{"yes_count":"250","no_count":"0","abstain_count":"0","no_with_veto_count":"0"}}`))
+		case "/cosmos/gov/v1/proposals/1051/votes":
+			_, _ = w.Write([]byte(`{"votes":[],"pagination":{"next_key":null}}`))
+		default:
+			http.NotFound(w, r)
+		}
 	}))
-	defer indexedRPC.Close()
+	defer rest.Close()
 
-	c := analysisTestCollector(indexedRPC.URL)
+	c := analysisTestCollector(rest.URL)
 	id := "1051"
-	prop := liveProposalForTest()
-	prop.FinalTallyResult.YesCount = "250"
 	c.metrics.GovTurnout.WithLabelValues(id).Set(0.9)
 	c.metrics.GovQuorumBuffer.WithLabelValues(id).Set(-0.9)
 
-	if err := c.analyzeProposals([]Proposal{prop}, nil, 1000, 0.4); err != nil {
+	if err := c.analyzeProposals([]Proposal{liveProposalForTest()}, nil, nil, 1000, 0.4, 0.334); err != nil {
 		t.Fatalf("analyzeProposals() returned an unexpected error: %v", err)
 	}
 	if got := testutil.ToFloat64(c.metrics.GovProposalLive.WithLabelValues(id)); got != 1 {
-		t.Errorf("proposal_live = %v, want 1 after a complete refresh", got)
-	}
-	if c.trackedProposals[id] {
-		t.Error("live proposal was marked immutable before its final closed-state refresh")
+		t.Errorf("proposal_live = %v, want 1 after a complete aggregate refresh", got)
 	}
 	if got := testutil.ToFloat64(c.metrics.GovTurnout.WithLabelValues(id)); got != 0.25 {
 		t.Errorf("turnout = %v, want the freshly analyzed value 0.25", got)
@@ -137,5 +136,8 @@ func TestAnalyzeProposalsPublishesLiveGateOnlyAfterSuccessfulAnalysis(t *testing
 	wantBuffer := 0.25 - 0.4
 	if got := testutil.ToFloat64(c.metrics.GovQuorumBuffer.WithLabelValues(id)); math.Abs(got-wantBuffer) > 1e-12 {
 		t.Errorf("quorum buffer = %v, want the freshly analyzed value %v", got, wantBuffer)
+	}
+	if got := testutil.ToFloat64(c.metrics.GovAttributionComplete.WithLabelValues(id)); got != 0 {
+		t.Errorf("attribution_complete = %v, want 0 when a non-zero tally has no current vote rows", got)
 	}
 }

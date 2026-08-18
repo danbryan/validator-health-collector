@@ -73,6 +73,25 @@ type TallyResponse struct {
 	Tally TallyResult `json:"tally"`
 }
 
+// ProposalVoteOption is one weighted choice in the governance REST response.
+type ProposalVoteOption struct {
+	Option string `json:"option"`
+	Weight string `json:"weight"`
+}
+
+// ProposalVote is the current vote recorded for one account.
+type ProposalVote struct {
+	ProposalID string               `json:"proposal_id"`
+	Voter      string               `json:"voter"`
+	Options    []ProposalVoteOption `json:"options"`
+}
+
+// ProposalVotesResponse wraps the paginated current-votes endpoint.
+type ProposalVotesResponse struct {
+	Votes      []ProposalVote `json:"votes"`
+	Pagination Pagination     `json:"pagination"`
+}
+
 // GovTallyParams are the governance thresholds that decide a proposal's outcome.
 type GovTallyParams struct {
 	Quorum        string `json:"quorum"`
