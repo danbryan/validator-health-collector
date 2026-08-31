@@ -11,6 +11,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/danbryan/validator-health-collector/collector"
+	collectorconfig "github.com/danbryan/validator-health-collector/config"
 	"github.com/danbryan/validator-health-collector/endpoints"
 	"github.com/danbryan/validator-health-collector/entity"
 )
@@ -24,12 +25,26 @@ func main() {
 	entityMapPath := flag.String("entity-map", "entity.yaml", "Path to entity map YAML file")
 	listenAddr := flag.String("listen", ":9090", "HTTP listen address for /metrics")
 	pollInterval := flag.Duration("interval", 1*time.Hour, "Polling interval")
+	configPath := flag.String("config", "", "Path to collector YAML configuration")
+	redelegationInterval := flag.Duration("redelegation-interval", 5*time.Minute, "Redelegation scan interval")
+	redelegationWindow := flag.Duration("redelegation-window", 168*time.Hour, "Rolling redelegation aggregation window")
 	proposalHistory := flag.Duration(
 		"proposal-history",
 		collector.DefaultProposalHistoryWindow,
 		"Maximum age of closed proposals exported for dashboard history; live proposals are always included",
 	)
 	flag.Parse()
+
+	cfg, err := collectorconfig.Load(*configPath)
+	if err != nil {
+		log.Fatalf("Invalid collector configuration: %v", err)
+	}
+	if *redelegationInterval <= 0 {
+		log.Fatalf("-redelegation-interval must be positive, got %v", *redelegationInterval)
+	}
+	if *redelegationWindow <= 0 {
+		log.Fatalf("-redelegation-window must be positive, got %v", *redelegationWindow)
+	}
 
 	// The entity map is what turns per-validator power into per-operator power, so
 	// whether it loaded decides whether concentration is measured correctly. An
@@ -63,12 +78,19 @@ func main() {
 
 	c := collector.New(resolver, em)
 	c.SetProposalHistoryWindow(*proposalHistory)
+	c.ConfigureRedelegation(
+		cfg.Redelegation.AlertThresholdPercent/100,
+		*redelegationInterval,
+		*redelegationWindow,
+	)
 
 	// Register metrics with Prometheus
 	prometheus.MustRegister(c.Metrics())
 
-	// Start the collection loop in the background
+	// Start the snapshot and redelegation loops independently. The latter waits
+	// until the initial snapshot has resolved endpoint capabilities.
 	go c.Run(*pollInterval)
+	go c.RunRedelegation()
 
 	// HTTP server for /metrics
 	http.Handle("/metrics", promhttp.Handler())
@@ -82,6 +104,8 @@ func main() {
 	logEndpointSource("REST", *restURL)
 	logEndpointSource("RPC", *rpcURL)
 	log.Printf("Poll interval: %v", *pollInterval)
+	log.Printf("Redelegation interval: %v, window: %v, alert threshold: %g%%",
+		*redelegationInterval, *redelegationWindow, cfg.Redelegation.AlertThresholdPercent)
 	log.Printf("Closed proposal history: %v", *proposalHistory)
 
 	server := &http.Server{
