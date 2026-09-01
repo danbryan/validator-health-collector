@@ -13,13 +13,15 @@ const registryTTL = 24 * time.Hour
 
 // Resolution is the outcome of one resolve pass.
 type Resolution struct {
-	REST []Candidate
-	RPC  []Candidate
+	REST     []Candidate
+	RPC      []Candidate
+	TxSearch []Candidate
 
-	// RESTAddresses and RPCAddresses are the healthy addresses in ranked order,
-	// ready to hand to a rotating client.
-	RESTAddresses []string
-	RPCAddresses  []string
+	// Addresses are ranked and ready for their respective rotating clients.
+	// TxSearchAddresses is deliberately distinct from ordinary REST health.
+	RESTAddresses     []string
+	RPCAddresses      []string
+	TxSearchAddresses []string
 
 	// FromOverride reports whether operator-supplied flags replaced discovery.
 	RESTFromOverride bool
@@ -101,8 +103,9 @@ func (r *Resolver) candidates() ChainAPIs {
 
 // Resolve probes the current candidate lists and returns them ranked.
 //
-// Overrides short-circuit probing for the protocol they cover: a pinned endpoint
-// is used as given, on the assumption that the operator meant it.
+// Overrides short-circuit ordinary protocol health probing, on the assumption
+// that the operator meant to pin them. A REST override still receives the
+// separate transaction-index capability probe.
 func (r *Resolver) Resolve() Resolution {
 	var res Resolution
 
@@ -110,12 +113,12 @@ func (r *Resolver) Resolve() Resolution {
 
 	if r.opts.RESTOverride != "" {
 		res.RESTFromOverride = true
-		res.REST = []Candidate{{
-			Endpoint: Endpoint{Provider: "override", Address: trimSlash(r.opts.RESTOverride)},
-			Healthy:  true,
-		}}
+		override := Endpoint{Provider: "override", Address: trimSlash(r.opts.RESTOverride)}
+		res.REST = []Candidate{{Endpoint: override, Healthy: true}}
+		res.TxSearch = ProbeTxSearch([]Endpoint{override})
 	} else {
 		res.REST = ProbeREST(apis.REST)
+		res.TxSearch = res.REST
 	}
 
 	if r.opts.RPCOverride != "" {
@@ -130,9 +133,11 @@ func (r *Resolver) Resolve() Resolution {
 
 	res.RESTAddresses = Addresses(res.REST)
 	res.RPCAddresses = Addresses(res.RPC)
+	res.TxSearchAddresses = TxSearchAddresses(res.TxSearch)
 
-	log.Printf("endpoints: %d/%d REST healthy, %d/%d RPC healthy",
-		len(res.RESTAddresses), len(res.REST), len(res.RPCAddresses), len(res.RPC))
+	log.Printf("endpoints: %d/%d REST healthy, %d/%d tx-search capable, %d/%d RPC healthy",
+		len(res.RESTAddresses), len(res.REST), len(res.TxSearchAddresses), len(res.TxSearch),
+		len(res.RPCAddresses), len(res.RPC))
 
 	if len(res.RPCAddresses) > 0 {
 		top, _ := Lookup(res.RPC, res.RPCAddresses[0])

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"sync"
@@ -28,6 +29,14 @@ type poolProbeBody struct {
 // poolProbeResponse wraps the staking pool probe response.
 type poolProbeResponse struct {
 	Pool poolProbeBody `json:"pool"`
+}
+
+// txSearchProbeResponse distinguishes a working transaction index from an
+// ordinary REST endpoint. Non-nil arrays prove that the endpoint understood the
+// tx-search response shape even when no matching transaction exists.
+type txSearchProbeResponse struct {
+	Txs         []json.RawMessage `json:"txs"`
+	TxResponses []json.RawMessage `json:"tx_responses"`
 }
 
 // statusProbeSyncInfo is the part of a CometBFT status response the RPC probe reads.
@@ -61,6 +70,11 @@ type Candidate struct {
 	// it is a ranking hint, never a guarantee.
 	EarliestHeight int64
 	LatestHeight   int64
+
+	// TxSearch is independent of Healthy. An endpoint can serve staking and
+	// governance correctly while lacking a transaction index.
+	TxSearch    bool
+	TxSearchErr string
 }
 
 // Addresses returns the addresses of the healthy candidates, in ranked order.
@@ -68,6 +82,18 @@ func Addresses(cands []Candidate) []string {
 	out := make([]string, 0, len(cands))
 	for _, c := range cands {
 		if c.Healthy {
+			out = append(out, c.Address)
+		}
+	}
+	return out
+}
+
+// TxSearchAddresses returns only endpoints whose transaction-search index
+// answered the dedicated capability probe.
+func TxSearchAddresses(cands []Candidate) []string {
+	out := make([]string, 0, len(cands))
+	for _, c := range cands {
+		if c.TxSearch {
 			out = append(out, c.Address)
 		}
 	}
@@ -154,6 +180,7 @@ func ProbeREST(eps []Endpoint) []Candidate {
 
 		c.Latency = time.Since(start)
 		c.Healthy = true
+		probeTxSearch(client, &c)
 		return c
 	})
 
@@ -164,6 +191,45 @@ func ProbeREST(eps []Endpoint) []Candidate {
 		return cands[i].Latency < cands[j].Latency
 	})
 	return cands
+}
+
+// ProbeTxSearch probes only transaction-search capability. It is used when
+// ordinary REST health is already established or trusted separately.
+func ProbeTxSearch(eps []Endpoint) []Candidate {
+	cands := probeAll(eps, func(ep Endpoint) Candidate {
+		c := Candidate{Endpoint: ep}
+		start := time.Now()
+		probeTxSearch(newProbeClient(), &c)
+		c.Latency = time.Since(start)
+		return c
+	})
+	sort.SliceStable(cands, func(i, j int) bool {
+		if cands[i].TxSearch != cands[j].TxSearch {
+			return cands[i].TxSearch
+		}
+		return cands[i].Latency < cands[j].Latency
+	})
+	return cands
+}
+
+func probeTxSearch(client *http.Client, candidate *Candidate) {
+	params := url.Values{}
+	params.Set("query", "message.action='/cosmos.staking.v1beta1.MsgBeginRedelegate'")
+	params.Set("page", "1")
+	params.Set("limit", "1")
+	params.Set("order_by", "ORDER_BY_DESC")
+
+	var response txSearchProbeResponse
+	path := "/cosmos/tx/v1beta1/txs?" + params.Encode()
+	if err := getJSON(client, candidate.Address+path, &response); err != nil {
+		candidate.TxSearchErr = err.Error()
+		return
+	}
+	if response.Txs == nil || response.TxResponses == nil {
+		candidate.TxSearchErr = "tx search response missing txs or tx_responses"
+		return
+	}
+	candidate.TxSearch = true
 }
 
 // ProbeRPC health checks CometBFT RPC endpoints and returns them ranked fastest

@@ -1,6 +1,8 @@
 package endpoints_test
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -73,6 +75,51 @@ func TestProbeRESTMarksUnreachableUnhealthy(t *testing.T) {
 	}
 }
 
+func TestProbeRESTKeepsStateHealthSeparateFromTxSearch(t *testing.T) {
+	t.Parallel()
+
+	stateOnly := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/cosmos/staking/v1beta1/pool":
+			_, _ = w.Write([]byte(`{"pool":{"bonded_tokens":"100"}}`))
+		case "/cosmos/tx/v1beta1/txs":
+			http.Error(w, "tx index disabled", http.StatusNotImplemented)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer stateOnly.Close()
+
+	fullyCapable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/cosmos/staking/v1beta1/pool":
+			_, _ = w.Write([]byte(`{"pool":{"bonded_tokens":"100"}}`))
+		case "/cosmos/tx/v1beta1/txs":
+			_, _ = w.Write([]byte(`{"txs":[],"tx_responses":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer fullyCapable.Close()
+
+	candidates := endpoints.ProbeREST([]endpoints.Endpoint{
+		{Provider: "state-only", Address: stateOnly.URL},
+		{Provider: "full", Address: fullyCapable.URL},
+	})
+	if len(endpoints.Addresses(candidates)) != 2 {
+		t.Fatalf("ordinary REST addresses = %v, want both healthy", endpoints.Addresses(candidates))
+	}
+	txAddresses := endpoints.TxSearchAddresses(candidates)
+	if len(txAddresses) != 1 || txAddresses[0] != fullyCapable.URL {
+		t.Fatalf("tx-search addresses = %v, want only %s", txAddresses, fullyCapable.URL)
+	}
+
+	stateCandidate, ok := endpoints.Lookup(candidates, stateOnly.URL)
+	if !ok || !stateCandidate.Healthy || stateCandidate.TxSearch || stateCandidate.TxSearchErr == "" {
+		t.Fatalf("state-only candidate = %#v, want healthy state and failed tx capability", stateCandidate)
+	}
+}
+
 func TestProbeRPCMarksUnreachableUnhealthy(t *testing.T) {
 	t.Parallel()
 
@@ -123,27 +170,61 @@ func TestFallbackListsAreUsable(t *testing.T) {
 	}
 }
 
-func TestResolverHonoursOverridesWithoutProbing(t *testing.T) {
+func TestResolverHonoursOverridesAndProbesTxCapability(t *testing.T) {
 	t.Parallel()
 
-	// Overrides must bypass discovery entirely. An unroutable registry URL proves
-	// the resolver never reached for it, and the trailing slash proves the
-	// override is normalised.
+	rest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/cosmos/tx/v1beta1/txs" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"txs":[],"tx_responses":[]}`))
+	}))
+	defer rest.Close()
+
+	// Overrides bypass registry discovery and ordinary protocol probing. The
+	// trailing slashes are normalized, while tx-search capability remains a
+	// separate real probe.
 	res := endpoints.NewResolver(endpoints.Options{
 		RegistryURL:  "http://127.0.0.1:1/%s.json",
 		Chain:        "cosmoshub",
-		RESTOverride: "https://rest.example.com/",
-		RPCOverride:  "https://rpc.example.com",
+		RESTOverride: rest.URL + "/",
+		RPCOverride:  "https://rpc.example.com/",
 	}).Resolve()
 
 	if !res.RESTFromOverride || !res.RPCFromOverride {
 		t.Error("Resolve() did not flag the results as coming from overrides")
 	}
-	if len(res.RESTAddresses) != 1 || res.RESTAddresses[0] != "https://rest.example.com" {
-		t.Errorf("REST addresses = %v, want [https://rest.example.com]", res.RESTAddresses)
+	if len(res.RESTAddresses) != 1 || res.RESTAddresses[0] != rest.URL {
+		t.Errorf("REST addresses = %v, want [%s]", res.RESTAddresses, rest.URL)
+	}
+	if len(res.TxSearchAddresses) != 1 || res.TxSearchAddresses[0] != rest.URL {
+		t.Errorf("tx-search addresses = %v, want [%s]", res.TxSearchAddresses, rest.URL)
 	}
 	if len(res.RPCAddresses) != 1 || res.RPCAddresses[0] != "https://rpc.example.com" {
 		t.Errorf("RPC addresses = %v, want [https://rpc.example.com]", res.RPCAddresses)
+	}
+}
+
+func TestResolverExcludesStateOnlyOverrideFromTxSearch(t *testing.T) {
+	t.Parallel()
+
+	stateOnly := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "index disabled", http.StatusNotImplemented)
+	}))
+	defer stateOnly.Close()
+
+	res := endpoints.NewResolver(endpoints.Options{
+		RegistryURL:  "http://127.0.0.1:1/%s.json",
+		Chain:        "cosmoshub",
+		RESTOverride: stateOnly.URL,
+		RPCOverride:  "https://rpc.example.com",
+	}).Resolve()
+	if len(res.RESTAddresses) != 1 {
+		t.Fatalf("REST override was removed after tx probe: %v", res.RESTAddresses)
+	}
+	if len(res.TxSearchAddresses) != 0 {
+		t.Fatalf("state-only override remained in tx-search addresses: %v", res.TxSearchAddresses)
 	}
 }
 

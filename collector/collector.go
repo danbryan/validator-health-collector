@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -75,51 +76,61 @@ const (
 
 // Metrics holds all Prometheus gauges for the validator health collector.
 type Metrics struct {
-	LastSuccess             prometheus.Gauge
-	QuerySuccess            *prometheus.GaugeVec
-	BlockHeight             prometheus.Gauge
-	ActiveValidators        prometheus.Gauge
-	LargestValShare         prometheus.Gauge
-	LargestEntShare         prometheus.Gauge
-	HaltCoeff               prometheus.Gauge
-	SafetyCoeff             prometheus.Gauge
-	GovTurnout              *prometheus.GaugeVec
-	GovQuorum               *prometheus.GaugeVec
-	GovSecondsRemaining     *prometheus.GaugeVec
-	ValMissedBlocks         *prometheus.GaugeVec
-	ValMissedBlocksInfo     *prometheus.GaugeVec
-	ValMissedRatio          *prometheus.GaugeVec
-	ValBlocksToJail         *prometheus.GaugeVec
-	ValSecondsToJail        *prometheus.GaugeVec
-	ValAtRiskPower          *prometheus.GaugeVec
-	SlashingParam           *prometheus.GaugeVec
-	ChainBlockTime          prometheus.Gauge
-	ValJailed               *prometheus.GaugeVec
-	ValInfo                 *prometheus.GaugeVec
-	EntityShare             *prometheus.GaugeVec
-	GovProposalInfo         *prometheus.GaugeVec
-	GovProposalQuorum       *prometheus.GaugeVec
-	GovProposalTally        *prometheus.GaugeVec
-	GovEntityVote           *prometheus.GaugeVec
-	GovProposalVetoRatio    *prometheus.GaugeVec
-	GovProposalQuorumMet    *prometheus.GaugeVec
-	GovProposalVetoState    *prometheus.GaugeVec
-	GovEntityVetoCapability *prometheus.GaugeVec
-	GovNonVoterPower        *prometheus.GaugeVec
-	GovWindow               *prometheus.GaugeVec
-	GovParticipationCount   *prometheus.GaugeVec
-	GovVetoThreshold        prometheus.Gauge
-	EntityCanVetoAlone      *prometheus.GaugeVec
-	AnyEntityCanVeto        prometheus.Gauge
-	VetoPowerNeeded         prometheus.Gauge
-	GovQuorumBuffer         *prometheus.GaugeVec
-	GovQuorumTarget         *prometheus.GaugeVec
-	UpgradeHeight           *prometheus.GaugeVec
-	BondedTokens            prometheus.Gauge
-	GovAttributionComplete  *prometheus.GaugeVec
-	EndpointInfo            *prometheus.GaugeVec
-	GovProposalLive         *prometheus.GaugeVec
-	SectionSuccess          *prometheus.GaugeVec
+	LastSuccess                  prometheus.Gauge
+	QuerySuccess                 *prometheus.GaugeVec
+	BlockHeight                  prometheus.Gauge
+	ActiveValidators             prometheus.Gauge
+	LargestValShare              prometheus.Gauge
+	LargestEntShare              prometheus.Gauge
+	HaltCoeff                    prometheus.Gauge
+	SafetyCoeff                  prometheus.Gauge
+	GovTurnout                   *prometheus.GaugeVec
+	GovQuorum                    *prometheus.GaugeVec
+	GovSecondsRemaining          *prometheus.GaugeVec
+	ValMissedBlocks              *prometheus.GaugeVec
+	ValMissedBlocksInfo          *prometheus.GaugeVec
+	ValMissedRatio               *prometheus.GaugeVec
+	ValBlocksToJail              *prometheus.GaugeVec
+	ValSecondsToJail             *prometheus.GaugeVec
+	ValAtRiskPower               *prometheus.GaugeVec
+	SlashingParam                *prometheus.GaugeVec
+	ChainBlockTime               prometheus.Gauge
+	ValJailed                    *prometheus.GaugeVec
+	ValInfo                      *prometheus.GaugeVec
+	EntityShare                  *prometheus.GaugeVec
+	GovProposalInfo              *prometheus.GaugeVec
+	GovProposalQuorum            *prometheus.GaugeVec
+	GovProposalTally             *prometheus.GaugeVec
+	GovEntityVote                *prometheus.GaugeVec
+	GovProposalVetoRatio         *prometheus.GaugeVec
+	GovProposalQuorumMet         *prometheus.GaugeVec
+	GovProposalVetoState         *prometheus.GaugeVec
+	GovEntityVetoCapability      *prometheus.GaugeVec
+	GovNonVoterPower             *prometheus.GaugeVec
+	GovWindow                    *prometheus.GaugeVec
+	GovParticipationCount        *prometheus.GaugeVec
+	GovVetoThreshold             prometheus.Gauge
+	EntityCanVetoAlone           *prometheus.GaugeVec
+	AnyEntityCanVeto             prometheus.Gauge
+	VetoPowerNeeded              prometheus.Gauge
+	GovQuorumBuffer              *prometheus.GaugeVec
+	GovQuorumTarget              *prometheus.GaugeVec
+	UpgradeHeight                *prometheus.GaugeVec
+	BondedTokens                 prometheus.Gauge
+	GovAttributionComplete       *prometheus.GaugeVec
+	EndpointInfo                 *prometheus.GaugeVec
+	GovProposalLive              *prometheus.GaugeVec
+	SectionSuccess               *prometheus.GaugeVec
+	RedelegationAlertThreshold   prometheus.Gauge
+	RedelegationOutflowRatio     *prometheus.GaugeVec
+	RedelegationOutflowATOM      *prometheus.GaugeVec
+	RedelegationFlowRatio        *prometheus.GaugeVec
+	RedelegationFlowATOM         *prometheus.GaugeVec
+	RedelegationEventCount       *prometheus.GaugeVec
+	RedelegationLatestEvent      *prometheus.GaugeVec
+	RedelegationThresholdCrossed *prometheus.GaugeVec
+	RedelegationScanSuccess      prometheus.Gauge
+	RedelegationScanLastSuccess  prometheus.Gauge
 }
 
 func NewMetrics() *Metrics {
@@ -304,6 +315,46 @@ func NewMetrics() *Metrics {
 			Name: "validator_health_collector_section_success",
 			Help: "Whether the last attempt at a section of the collection cycle succeeded (1) or failed (0).",
 		}, []string{"section"}),
+		RedelegationAlertThreshold: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "validator_health_redelegation_alert_threshold_ratio",
+			Help: "Configured rolling redelegation outflow alert threshold as a ratio (0-1).",
+		}),
+		RedelegationOutflowRatio: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_redelegation_outflow_ratio",
+			Help: "Successful uatom redelegated from a source validator during the rolling window, divided by the current bonded staking pool.",
+		}, []string{"source_validator", "source_moniker", "source_entity"}),
+		RedelegationOutflowATOM: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_redelegation_outflow_atom",
+			Help: "ATOM successfully redelegated from a source validator during the rolling window.",
+		}, []string{"source_validator", "source_moniker", "source_entity"}),
+		RedelegationFlowRatio: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_redelegation_flow_ratio",
+			Help: "Successful source-to-destination uatom redelegation flow during the rolling window, divided by the current bonded staking pool.",
+		}, []string{"source_validator", "source_moniker", "source_entity", "destination_validator", "destination_moniker", "destination_entity"}),
+		RedelegationFlowATOM: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_redelegation_flow_atom",
+			Help: "Successful source-to-destination redelegation flow in ATOM during the rolling window.",
+		}, []string{"source_validator", "source_moniker", "source_entity", "destination_validator", "destination_moniker", "destination_entity"}),
+		RedelegationEventCount: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_redelegation_event_count",
+			Help: "Count of successful source-to-destination uatom redelegation messages during the rolling window.",
+		}, []string{"source_validator", "source_moniker", "source_entity", "destination_validator", "destination_moniker", "destination_entity"}),
+		RedelegationLatestEvent: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_redelegation_latest_event_timestamp_seconds",
+			Help: "Unix timestamp of the latest successful uatom redelegation from a source validator in the rolling window.",
+		}, []string{"source_validator", "source_moniker", "source_entity"}),
+		RedelegationThresholdCrossed: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_redelegation_threshold_crossed_timestamp_seconds",
+			Help: "Unix timestamp of the most recent below-to-at-or-above configured-threshold transition for a source validator's rolling redelegation outflow.",
+		}, []string{"source_validator", "source_moniker", "source_entity"}),
+		RedelegationScanSuccess: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "validator_health_redelegation_scan_success",
+			Help: "Whether the last redelegation scan completed without partial data (1) or failed (0).",
+		}),
+		RedelegationScanLastSuccess: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "validator_health_redelegation_scan_last_success_timestamp_seconds",
+			Help: "Unix timestamp of the last complete redelegation scan.",
+		}),
 	}
 }
 
@@ -354,6 +405,16 @@ func (m *Metrics) Describe(ch chan<- *prometheus.Desc) {
 	m.EndpointInfo.Describe(ch)
 	m.GovProposalLive.Describe(ch)
 	m.SectionSuccess.Describe(ch)
+	m.RedelegationAlertThreshold.Describe(ch)
+	m.RedelegationOutflowRatio.Describe(ch)
+	m.RedelegationOutflowATOM.Describe(ch)
+	m.RedelegationFlowRatio.Describe(ch)
+	m.RedelegationFlowATOM.Describe(ch)
+	m.RedelegationEventCount.Describe(ch)
+	m.RedelegationLatestEvent.Describe(ch)
+	m.RedelegationThresholdCrossed.Describe(ch)
+	m.RedelegationScanSuccess.Describe(ch)
+	m.RedelegationScanLastSuccess.Describe(ch)
 }
 
 // Collect implements prometheus.Collector.
@@ -403,6 +464,16 @@ func (m *Metrics) Collect(ch chan<- prometheus.Metric) {
 	m.EndpointInfo.Collect(ch)
 	m.GovProposalLive.Collect(ch)
 	m.SectionSuccess.Collect(ch)
+	m.RedelegationAlertThreshold.Collect(ch)
+	m.RedelegationOutflowRatio.Collect(ch)
+	m.RedelegationOutflowATOM.Collect(ch)
+	m.RedelegationFlowRatio.Collect(ch)
+	m.RedelegationFlowATOM.Collect(ch)
+	m.RedelegationEventCount.Collect(ch)
+	m.RedelegationLatestEvent.Collect(ch)
+	m.RedelegationThresholdCrossed.Collect(ch)
+	m.RedelegationScanSuccess.Collect(ch)
+	m.RedelegationScanLastSuccess.Collect(ch)
 }
 
 // Collector orchestrates the polling and metric updates.
@@ -421,6 +492,11 @@ type Collector struct {
 	// Previous snapshot for detecting changes
 	prevValidators map[string]bool // operator_address -> present
 	firstRun       bool
+
+	redelegation          *RedelegationScanner
+	redelegationInterval  time.Duration
+	redelegationReady     chan struct{}
+	redelegationReadyOnce sync.Once
 }
 
 // New builds a collector that discovers its endpoints through the resolver at the
@@ -435,7 +511,14 @@ func New(resolver *endpoints.Resolver, entityMap map[string]string) *Collector {
 		proposalHistoryWindow: DefaultProposalHistoryWindow,
 		prevValidators:        make(map[string]bool),
 		firstRun:              true,
+		redelegationReady:     make(chan struct{}),
 	}
+}
+
+// ConfigureRedelegation enables the independent rolling redelegation scanner.
+func (c *Collector) ConfigureRedelegation(thresholdRatio float64, interval, window time.Duration) {
+	c.redelegationInterval = interval
+	c.redelegation = NewRedelegationScanner(c.metrics, c.entityMap, window, 2*interval, thresholdRatio)
 }
 
 // SetProposalHistoryWindow sets the maximum age of closed proposals exported to
@@ -467,12 +550,19 @@ func (c *Collector) resolveEndpoints() error {
 
 	c.restClient.SetEndpoints(res.RESTAddresses)
 	c.rpcClient.SetEndpoints(res.RPCAddresses)
+	if c.redelegation != nil {
+		c.redelegation.SetEndpoints(res.RESTAddresses, res.TxSearchAddresses)
+		c.redelegationReadyOnce.Do(func() { close(c.redelegationReady) })
+	}
 
 	// Republish from scratch so a rotation does not leave the previous endpoint
 	// reporting as current alongside the new one.
 	c.metrics.EndpointInfo.Reset()
 	c.publishEndpoint("rest", res.REST, c.restClient.BaseURL())
 	c.publishEndpoint("rpc", res.RPC, c.rpcClient.BaseURL())
+	if len(res.TxSearchAddresses) > 0 {
+		c.publishEndpoint("tx_search", res.TxSearch, res.TxSearchAddresses[0])
+	}
 
 	return nil
 }
@@ -1150,6 +1240,30 @@ func (c *Collector) Run(interval time.Duration) {
 		<-timer.C
 		if err := c.CollectSnapshot(); err != nil {
 			log.Printf("Collection failed: %v", err)
+		}
+	}
+}
+
+// RunRedelegation waits for the initial snapshot to resolve endpoints, then
+// runs independently of the hourly snapshot loop.
+func (c *Collector) RunRedelegation() {
+	if c.redelegation == nil || c.redelegationInterval <= 0 {
+		return
+	}
+	<-c.redelegationReady
+
+	run := func() {
+		if err := c.redelegation.Scan(time.Now()); err != nil {
+			log.Printf("Redelegation scan failed: %v", err)
+		}
+	}
+	run()
+
+	ticker := time.NewTicker(c.redelegationInterval)
+	defer ticker.Stop()
+	for now := range ticker.C {
+		if err := c.redelegation.Scan(now); err != nil {
+			log.Printf("Redelegation scan failed: %v", err)
 		}
 	}
 }
