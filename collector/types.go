@@ -107,15 +107,18 @@ type GovParamsResponse struct {
 // SigningInfo is one validator's slashing-module signing record.
 type SigningInfo struct {
 	Address             string `json:"address"`
+	JailedUntil         string `json:"jailed_until"`
+	Tombstoned          bool   `json:"tombstoned"`
 	MissedBlocksCounter string `json:"missed_blocks_counter"`
 }
 
 // SlashingParamsRaw is the slashing configuration as strings from the API.
 type SlashingParamsRaw struct {
-	SignedBlocksWindow    string `json:"signed_blocks_window"`
-	MinSignedPerWindow    string `json:"min_signed_per_window"`
-	DowntimeJailDuration  string `json:"downtime_jail_duration"`
-	SlashFractionDowntime string `json:"slash_fraction_downtime"`
+	SignedBlocksWindow      string `json:"signed_blocks_window"`
+	MinSignedPerWindow      string `json:"min_signed_per_window"`
+	DowntimeJailDuration    string `json:"downtime_jail_duration"`
+	SlashFractionDoubleSign string `json:"slash_fraction_double_sign"`
+	SlashFractionDowntime   string `json:"slash_fraction_downtime"`
 }
 
 // SlashingParamsResponse wraps the slashing-params query.
@@ -164,6 +167,90 @@ type SigningInfosResponse struct {
 	Pagination Pagination    `json:"pagination"`
 }
 
+// Coin is an SDK coin returned by staking delegation queries.
+type Coin struct {
+	Denom  string `json:"denom"`
+	Amount string `json:"amount"`
+}
+
+// Delegation identifies a delegator's position with one validator.
+type Delegation struct {
+	DelegatorAddress string `json:"delegator_address"`
+	ValidatorAddress string `json:"validator_address"`
+	Shares           string `json:"shares"`
+}
+
+// DelegationResponse combines delegation metadata with its current token balance.
+type DelegationResponse struct {
+	Delegation Delegation `json:"delegation"`
+	Balance    Coin       `json:"balance"`
+}
+
+// DelegationsResponse wraps a paginated delegator query.
+type DelegationsResponse struct {
+	DelegationResponses []DelegationResponse `json:"delegation_responses"`
+	Pagination          Pagination           `json:"pagination"`
+}
+
+// ManagedDelegation is a positive uatom delegation used by managed-account scans.
+type ManagedDelegation struct {
+	OperatorAddress string
+	AmountUAtom     float64
+}
+
+// Redelegation identifies one source-to-destination redelegation group.
+type Redelegation struct {
+	DelegatorAddress string `json:"delegator_address"`
+	SourceValidator  string `json:"validator_src_address"`
+	DestValidator    string `json:"validator_dst_address"`
+}
+
+// RedelegationEntry contains a chain-returned redelegation completion time.
+type RedelegationEntry struct {
+	CompletionTime string `json:"completion_time"`
+}
+
+// RedelegationEntryResponse is the staking module's calculated entry balance.
+type RedelegationEntryResponse struct {
+	Entry   RedelegationEntry `json:"redelegation_entry"`
+	Balance string            `json:"balance"`
+}
+
+// RedelegationResponse combines a route with its current chain-returned entries.
+type RedelegationResponse struct {
+	Redelegation Redelegation                `json:"redelegation"`
+	Entries      []RedelegationEntryResponse `json:"entries"`
+}
+
+// RedelegationsResponse wraps paginated receiving redelegations for a delegator.
+type RedelegationsResponse struct {
+	RedelegationResponses []RedelegationResponse `json:"redelegation_responses"`
+	Pagination            Pagination             `json:"pagination"`
+}
+
+// ReceivingRedelegation is one parsed entry still returned by current chain state.
+type ReceivingRedelegation struct {
+	DelegatorAddress    string
+	DestinationOperator string
+	BalanceUAtom        float64
+	CompletionTime      time.Time
+}
+
+// AnnualProvisionsResponse wraps the mint module's annual issuance estimate.
+type AnnualProvisionsResponse struct {
+	AnnualProvisions string `json:"annual_provisions"`
+}
+
+// DistributionParams contains the community-pool tax applied to rewards.
+type DistributionParams struct {
+	CommunityTax string `json:"community_tax"`
+}
+
+// DistributionParamsResponse wraps distribution module parameters.
+type DistributionParamsResponse struct {
+	Params DistributionParams `json:"params"`
+}
+
 // CometNodeInfo identifies the chain a CometBFT node is following.
 type CometNodeInfo struct {
 	Network string `json:"network"`
@@ -196,8 +283,9 @@ type CometValidator struct {
 
 // CometValidatorsResult is the body of a CometBFT /validators response.
 type CometValidatorsResult struct {
-	Total      string           `json:"total"`
-	Validators []CometValidator `json:"validators"`
+	BlockHeight string           `json:"block_height"`
+	Total       string           `json:"total"`
+	Validators  []CometValidator `json:"validators"`
 }
 
 // CometValidatorsResponse wraps a CometBFT /validators response.
@@ -225,6 +313,36 @@ type BlockResult struct {
 type BlockResponse struct {
 	Result BlockResult `json:"result"`
 }
+
+// CometCommitSignature records one validator's signature state in a commit.
+type CometCommitSignature struct {
+	BlockIDFlag      int    `json:"block_id_flag"`
+	ValidatorAddress string `json:"validator_address"`
+}
+
+// CometCommit is the subset of a signed commit needed for recent signing checks.
+type CometCommit struct {
+	Height     string                 `json:"height"`
+	Signatures []CometCommitSignature `json:"signatures"`
+}
+
+// CometSignedHeader wraps the commit returned by CometBFT.
+type CometSignedHeader struct {
+	Commit CometCommit `json:"commit"`
+}
+
+// CometCommitResult is the body of a CometBFT /commit response.
+type CometCommitResult struct {
+	SignedHeader CometSignedHeader `json:"signed_header"`
+}
+
+// CometCommitResponse wraps a CometBFT /commit response.
+type CometCommitResponse struct {
+	Result CometCommitResult `json:"result"`
+}
+
+// CommitSigners is the uppercase hex consensus-address set that signed a commit.
+type CommitSigners map[string]bool
 
 // Snapshot is one complete reading of validator-set health.
 type Snapshot struct {

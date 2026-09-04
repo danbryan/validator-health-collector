@@ -20,7 +20,7 @@ env:
   REGISTRY: ghcr.io
   ORG: ${{ github.repository_owner }}
   IMAGE_NAME: validator-health-collector
-  IMAGE_VERSION: v0.1.3
+  IMAGE_VERSION: v0.1.4
 
 jobs:
   test:
@@ -38,7 +38,7 @@ jobs:
       - name: Test
         run: |
           go test ./...
-          go test -race ./collector ./endpoints
+          go test -race ./collector ./config ./endpoints
           go vet ./...
 
   build:

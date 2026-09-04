@@ -1,6 +1,6 @@
 # Validator Health Collector
 
-`validator-health-collector` exports Prometheus metrics for Cosmos Hub validator-set health. It collects validator concentration, signing and jailing risk, governance participation, upgrades, rolling redelegation outflow, and collector health data from public Cosmos REST and CometBFT RPC endpoints.
+`validator-health-collector` exports Prometheus metrics for Cosmos Hub validator-set health. It collects validator concentration, signing and jailing risk, governance participation, upgrades, rolling redelegation outflow, managed-delegation exposure, and collector health data from public Cosmos REST and CometBFT RPC endpoints.
 
 The collector discovers candidate endpoints from the Cosmos Chain Registry, validates that they serve the requested chain, and rotates away from unhealthy endpoints. REST and RPC endpoints can also be pinned explicitly. Ordinary REST health and transaction-search capability are probed separately, so a node can remain available for staking and governance while being excluded from redelegation searches.
 
@@ -15,7 +15,8 @@ Requirements:
 
 ```sh
 go run . -chain=cosmoshub -listen=:9090 -interval=1h \
-  -redelegation-interval=5m -redelegation-window=168h
+  -redelegation-interval=5m -redelegation-window=168h \
+  -managed-delegation-interval=5m
 ```
 
 Metrics are available at `http://localhost:9090/metrics` and the health endpoint is available at `http://localhost:9090/health`.
@@ -27,9 +28,23 @@ Production passes a Git-backed configuration file:
 ```yaml
 redelegation:
   alert_threshold_percent: 2
+managed_delegations:
+  warning_jail_progress_percent: 10
+  critical_jail_progress_percent: 80
+  accounts:
+    - name: Amina
+      address: cosmos1f3vdsge09avpxsym5233xgskwv2q5s3cg57dcs
 ```
 
-Use it with `-config=/etc/validator-health/config.yaml`. The value may be decimal, must be greater than 0 and at most 100, and an explicitly supplied missing or invalid file prevents startup.
+Use it with `-config=/etc/validator-health/config.yaml`. Thresholds may be decimal. The managed thresholds are percentages of the live maximum missed-block budget before jail, and must satisfy `0 < warning < critical < 100`. Account names and valid `cosmos` account addresses are trimmed, account addresses are canonicalized to lowercase, and both must be unique after normalization. An explicitly supplied missing or invalid file prevents startup.
+
+## Managed delegation risk
+
+The managed-delegation scanner discovers every current positive `uatom` delegation from the configured accounts. It aggregates overlapping accounts into one validator risk series while retaining per-account balances. Zero balances do not count.
+
+Every five minutes it refreshes validator metadata, the active consensus set, slashing state, live slashing parameters, the latest 10 completed CometBFT commits, each sampled height's exact consensus set, and receiving redelegation entries returned by current chain state. Metrics expose jail progress, the miss rate over sampled blocks where each validator was eligible, estimated time to jail, current jailed and tombstoned state, one-time downtime and double-sign slash exposure, estimated hourly reward loss, and the amount estimated to be available or locked for another redelegation. Any receiving redelegation entry still returned by the chain locks the full current delegation for that delegator-account and destination-validator pair, regardless of its calculated balance or whether its completion timestamp has passed locally. Completion timestamps remain available as informational unlock estimates. Reward-loss metrics are omitted when their optional issuance or distribution inputs are unavailable; signing-risk metrics continue to update.
+
+A scan publishes no partial roster. On a core query failure, the last complete metrics remain available, `validator_health_managed_delegation_scan_success` becomes zero, and its last-success timestamp does not advance.
 
 To bypass endpoint discovery:
 
@@ -56,7 +71,7 @@ Pass a different map with `-entity-map=/path/to/entity.yaml`. If the specified f
 The `main` branch publishes an amd64 image to:
 
 ```text
-ghcr.io/danbryan/validator-health-collector:v0.1.3
+ghcr.io/danbryan/validator-health-collector:v0.1.4
 ```
 
 Build it locally with:
@@ -69,6 +84,6 @@ docker build -t validator-health-collector .
 
 ```sh
 go test ./...
-go test -race ./collector ./endpoints
+go test -race ./collector ./config ./endpoints
 go vet ./...
 ```
