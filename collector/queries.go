@@ -3,6 +3,8 @@ package collector
 import (
 	"errors"
 	"fmt"
+	"math"
+	"math/big"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -67,17 +69,30 @@ func (c *RPCClient) get(path string, dst any) error {
 
 // QueryBondedValidators fetches all bonded validators with pagination.
 func (c *RESTClient) QueryBondedValidators() ([]Validator, error) {
+	return c.queryValidators("BOND_STATUS_BONDED")
+}
+
+// QueryAllValidators fetches every validator status with pagination.
+func (c *RESTClient) QueryAllValidators() ([]Validator, error) {
+	return c.queryValidators("")
+}
+
+func (c *RESTClient) queryValidators(status string) ([]Validator, error) {
 	var all []Validator
 	var nextKey string
 
 	for {
-		path := "/cosmos/staking/v1beta1/validators?status=BOND_STATUS_BONDED&pagination.limit=100"
+		params := url.Values{}
+		params.Set("pagination.limit", "100")
+		if status != "" {
+			params.Set("status", status)
+		}
 		if nextKey != "" {
-			path += "&pagination.key=" + url.QueryEscape(nextKey)
+			params.Set("pagination.key", nextKey)
 		}
 
 		var resp ValidatorsResponse
-		if err := c.get(path, &resp); err != nil {
+		if err := c.get("/cosmos/staking/v1beta1/validators?"+params.Encode(), &resp); err != nil {
 			return nil, fmt.Errorf("querying validators: %w", err)
 		}
 		all = append(all, resp.Validators...)
@@ -95,11 +110,95 @@ func (c *RESTClient) QueryStakingPool() (float64, error) {
 	if err := c.get("/cosmos/staking/v1beta1/pool", &resp); err != nil {
 		return 0, fmt.Errorf("querying pool: %w", err)
 	}
-	bonded, err := strconv.ParseFloat(resp.Pool.BondedTokens, 64)
+	bonded, err := parseUAtom(resp.Pool.BondedTokens)
 	if err != nil {
 		return 0, fmt.Errorf("parsing bonded tokens: %w", err)
 	}
 	return bonded, nil
+}
+
+// QueryDelegations fetches every positive uatom delegation for an account.
+func (c *RESTClient) QueryDelegations(delegator string) ([]ManagedDelegation, error) {
+	var all []ManagedDelegation
+	var nextKey string
+	for {
+		params := url.Values{}
+		params.Set("pagination.limit", "100")
+		if nextKey != "" {
+			params.Set("pagination.key", nextKey)
+		}
+		path := "/cosmos/staking/v1beta1/delegations/" + url.PathEscape(delegator) + "?" + params.Encode()
+		var resp DelegationsResponse
+		if err := c.get(path, &resp); err != nil {
+			return nil, fmt.Errorf("querying delegations for %s: %w", delegator, err)
+		}
+		for i, item := range resp.DelegationResponses {
+			if item.Delegation.ValidatorAddress == "" {
+				return nil, fmt.Errorf("delegation %d for %s has no validator address", i, delegator)
+			}
+			if item.Balance.Denom != "uatom" {
+				return nil, fmt.Errorf("delegation %d for %s has unsupported denom %q", i, delegator, item.Balance.Denom)
+			}
+			amount, err := parseUAtom(item.Balance.Amount)
+			if err != nil {
+				return nil, fmt.Errorf("delegation %d for %s has invalid amount %q: %w", i, delegator, item.Balance.Amount, err)
+			}
+			if amount > 0 {
+				all = append(all, ManagedDelegation{OperatorAddress: item.Delegation.ValidatorAddress, AmountUAtom: amount})
+			}
+		}
+		if resp.Pagination.NextKey == "" || resp.Pagination.NextKey == nullNextKey {
+			break
+		}
+		nextKey = resp.Pagination.NextKey
+	}
+	return all, nil
+}
+
+// QueryReceivingRedelegations fetches every receiving redelegation entry still
+// returned by current chain state. The chain response, rather than local time or
+// calculated balance, determines whether a delegator-destination pair is locked.
+func (c *RESTClient) QueryReceivingRedelegations(delegator string) ([]ReceivingRedelegation, error) {
+	var all []ReceivingRedelegation
+	var nextKey string
+	for {
+		params := url.Values{}
+		params.Set("pagination.limit", "100")
+		if nextKey != "" {
+			params.Set("pagination.key", nextKey)
+		}
+		path := "/cosmos/staking/v1beta1/delegators/" + url.PathEscape(delegator) + "/redelegations?" + params.Encode()
+		var resp RedelegationsResponse
+		if err := c.get(path, &resp); err != nil {
+			return nil, fmt.Errorf("querying receiving redelegations for %s: %w", delegator, err)
+		}
+		for i, response := range resp.RedelegationResponses {
+			if response.Redelegation.DestValidator == "" {
+				return nil, fmt.Errorf("redelegation %d for %s has no destination validator", i, delegator)
+			}
+			for j, entry := range response.Entries {
+				amount, err := parseUAtom(entry.Balance)
+				if err != nil {
+					return nil, fmt.Errorf("redelegation %d entry %d for %s has invalid balance %q: %w", i, j, delegator, entry.Balance, err)
+				}
+				completion, err := time.Parse(time.RFC3339Nano, entry.Entry.CompletionTime)
+				if err != nil {
+					return nil, fmt.Errorf("redelegation %d entry %d for %s has invalid completion time %q: %w", i, j, delegator, entry.Entry.CompletionTime, err)
+				}
+				all = append(all, ReceivingRedelegation{
+					DelegatorAddress:    delegator,
+					DestinationOperator: response.Redelegation.DestValidator,
+					BalanceUAtom:        amount,
+					CompletionTime:      completion,
+				})
+			}
+		}
+		if resp.Pagination.NextKey == "" || resp.Pagination.NextKey == nullNextKey {
+			break
+		}
+		nextKey = resp.Pagination.NextKey
+	}
+	return all, nil
 }
 
 // QueryConsensusSet returns the set of validators actually participating in
@@ -111,19 +210,45 @@ func (c *RESTClient) QueryStakingPool() (float64, error) {
 // active consensus set (180 on the Hub). The 20 in between are bonded but are
 // not signing blocks, so they must not count toward set-health metrics.
 func (c *RPCClient) QueryConsensusSet() (map[string]bool, error) {
-	set := make(map[string]bool)
+	return c.QueryConsensusSetAtHeight(0)
+}
 
+// QueryConsensusSetAtHeight returns the consensus validator set at an exact
+// height. Height 0 asks CometBFT for the current set.
+func (c *RPCClient) QueryConsensusSetAtHeight(height int64) (map[string]bool, error) {
+	if height < 0 {
+		return nil, fmt.Errorf("querying consensus set: invalid height %d", height)
+	}
+
+	set := make(map[string]bool)
 	for page := 1; ; page++ {
+		params := url.Values{}
+		params.Set("page", strconv.Itoa(page))
+		params.Set("per_page", "100")
+		if height > 0 {
+			params.Set("height", strconv.FormatInt(height, 10))
+		}
 		var cv CometValidatorsResponse
-		path := fmt.Sprintf("/validators?per_page=100&page=%d", page)
-		if err := c.get(path, &cv); err != nil {
+		if err := c.get("/validators?"+params.Encode(), &cv); err != nil {
+			if height > 0 {
+				return nil, fmt.Errorf("querying consensus set at height %d: %w", height, err)
+			}
 			return nil, fmt.Errorf("querying consensus set: %w", err)
+		}
+		if height > 0 {
+			returnedHeight, err := strconv.ParseInt(cv.Result.BlockHeight, 10, 64)
+			if err != nil || returnedHeight != height {
+				return nil, fmt.Errorf("querying consensus set at height %d: response has height %q", height, cv.Result.BlockHeight)
+			}
 		}
 		for _, v := range cv.Result.Validators {
 			set[strings.ToUpper(v.Address)] = true
 		}
 
-		total, _ := strconv.Atoi(cv.Result.Total)
+		total, err := strconv.Atoi(cv.Result.Total)
+		if err != nil || total < 0 {
+			return nil, fmt.Errorf("querying consensus set: invalid total %q", cv.Result.Total)
+		}
 		if len(set) >= total || len(cv.Result.Validators) == 0 {
 			break
 		}
@@ -131,14 +256,42 @@ func (c *RPCClient) QueryConsensusSet() (map[string]bool, error) {
 	return set, nil
 }
 
+// QueryCommitSigners fetches one exact completed commit and returns the
+// uppercase hex consensus addresses whose signatures commit that block.
+func (c *RPCClient) QueryCommitSigners(height int64) (CommitSigners, error) {
+	if height <= 0 {
+		return nil, fmt.Errorf("querying commit signers: invalid height %d", height)
+	}
+
+	var response CometCommitResponse
+	path := "/commit?height=" + strconv.FormatInt(height, 10)
+	if err := c.get(path, &response); err != nil {
+		return nil, fmt.Errorf("querying commit signers at height %d: %w", height, err)
+	}
+	returnedHeight, err := strconv.ParseInt(response.Result.SignedHeader.Commit.Height, 10, 64)
+	if err != nil || returnedHeight != height {
+		return nil, fmt.Errorf("querying commit signers at height %d: response has height %q", height, response.Result.SignedHeader.Commit.Height)
+	}
+
+	signers := make(CommitSigners)
+	for _, signature := range response.Result.SignedHeader.Commit.Signatures {
+		if signature.BlockIDFlag != 2 || signature.ValidatorAddress == "" {
+			continue
+		}
+		signers[strings.ToUpper(signature.ValidatorAddress)] = true
+	}
+	return signers, nil
+}
+
 // SlashingParams holds the on-chain slashing configuration.
 type SlashingParams struct {
-	SignedBlocksWindow    int64
-	MinSignedPerWindow    float64
-	MinSignedBlocks       int64 // window * minSignedPerWindow
-	MaxMissedBlocks       int64 // window - minSignedBlocks; jail past this
-	DowntimeJailDuration  string
-	SlashFractionDowntime float64
+	SignedBlocksWindow      int64
+	MinSignedPerWindow      float64
+	MinSignedBlocks         int64 // SDK-rounded window * minSignedPerWindow
+	MaxMissedBlocks         int64 // window - minSignedBlocks; jail past this
+	DowntimeJailDuration    string
+	SlashFractionDoubleSign float64
+	SlashFractionDowntime   float64
 }
 
 // QuerySlashingParams fetches the on-chain slashing parameters. These drive
@@ -149,23 +302,34 @@ func (c *RESTClient) QuerySlashingParams() (*SlashingParams, error) {
 		return nil, fmt.Errorf("querying slashing params: %w", err)
 	}
 	window, err := strconv.ParseInt(resp.Params.SignedBlocksWindow, 10, 64)
-	if err != nil {
-		return nil, fmt.Errorf("parsing signed_blocks_window: %w", err)
+	if err != nil || window <= 0 {
+		return nil, fmt.Errorf("invalid signed_blocks_window %q", resp.Params.SignedBlocksWindow)
 	}
-	minRatio, err := strconv.ParseFloat(resp.Params.MinSignedPerWindow, 64)
+	minRatio, minSigned, err := parseMinSignedBlocks(resp.Params.MinSignedPerWindow, window)
 	if err != nil {
 		return nil, fmt.Errorf("parsing min_signed_per_window: %w", err)
 	}
-	slashFrac, _ := strconv.ParseFloat(resp.Params.SlashFractionDowntime, 64)
+	doubleSign, err := parseRatio(resp.Params.SlashFractionDoubleSign)
+	if err != nil {
+		return nil, fmt.Errorf("parsing slash_fraction_double_sign: %w", err)
+	}
+	downtime, err := parseRatio(resp.Params.SlashFractionDowntime)
+	if err != nil {
+		return nil, fmt.Errorf("parsing slash_fraction_downtime: %w", err)
+	}
 
-	minSigned := int64(float64(window) * minRatio)
+	maxMissed := window - minSigned
+	if maxMissed <= 0 {
+		return nil, fmt.Errorf("slashing params produce non-positive maximum missed blocks: %d", maxMissed)
+	}
 	return &SlashingParams{
-		SignedBlocksWindow:    window,
-		MinSignedPerWindow:    minRatio,
-		MinSignedBlocks:       minSigned,
-		MaxMissedBlocks:       window - minSigned,
-		DowntimeJailDuration:  resp.Params.DowntimeJailDuration,
-		SlashFractionDowntime: slashFrac,
+		SignedBlocksWindow:      window,
+		MinSignedPerWindow:      minRatio,
+		MinSignedBlocks:         minSigned,
+		MaxMissedBlocks:         maxMissed,
+		DowntimeJailDuration:    resp.Params.DowntimeJailDuration,
+		SlashFractionDoubleSign: doubleSign,
+		SlashFractionDowntime:   downtime,
 	}, nil
 }
 
@@ -181,14 +345,23 @@ func (c *RPCClient) MeasureBlockTime(sampleBlocks int64) (float64, error) {
 		if err := c.get(path, &bh); err != nil {
 			return 0, time.Time{}, err
 		}
-		h, _ := strconv.ParseInt(bh.Result.Block.Header.Height, 10, 64)
+		h, err := strconv.ParseInt(bh.Result.Block.Header.Height, 10, 64)
+		if err != nil || h <= 0 {
+			return 0, time.Time{}, fmt.Errorf("invalid block height %q", bh.Result.Block.Header.Height)
+		}
 		t, err := time.Parse(time.RFC3339Nano, bh.Result.Block.Header.Time)
-		return h, t, err
+		if err != nil {
+			return 0, time.Time{}, fmt.Errorf("invalid block time %q: %w", bh.Result.Block.Header.Time, err)
+		}
+		return h, t, nil
 	}
 
 	hLatest, tLatest, err := fetch(0)
 	if err != nil {
 		return 0, err
+	}
+	if sampleBlocks <= 0 || hLatest <= sampleBlocks {
+		return 0, errors.New("invalid block-time sample range")
 	}
 	hOld, tOld, err := fetch(hLatest - sampleBlocks)
 	if err != nil {
@@ -342,6 +515,81 @@ func (c *RESTClient) QuerySigningInfos() ([]SigningInfo, error) {
 	return all, nil
 }
 
+// QueryAnnualProvisions fetches the mint module's annual uatom provisions.
+func (c *RESTClient) QueryAnnualProvisions() (float64, error) {
+	var resp AnnualProvisionsResponse
+	if err := c.get("/cosmos/mint/v1beta1/annual_provisions", &resp); err != nil {
+		return 0, fmt.Errorf("querying annual provisions: %w", err)
+	}
+	value, err := parseNonNegativeDecimal(resp.AnnualProvisions)
+	if err != nil {
+		return 0, fmt.Errorf("parsing annual provisions: %w", err)
+	}
+	return value, nil
+}
+
+// QueryCommunityTax fetches the distribution community tax ratio.
+func (c *RESTClient) QueryCommunityTax() (float64, error) {
+	var resp DistributionParamsResponse
+	if err := c.get("/cosmos/distribution/v1beta1/params", &resp); err != nil {
+		return 0, fmt.Errorf("querying distribution params: %w", err)
+	}
+	value, err := parseRatio(resp.Params.CommunityTax)
+	if err != nil {
+		return 0, fmt.Errorf("parsing community tax: %w", err)
+	}
+	return value, nil
+}
+
+func parseUAtom(raw string) (float64, error) {
+	value, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return float64(value), nil
+}
+
+func parseNonNegativeDecimal(raw string) (float64, error) {
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+		return 0, fmt.Errorf("invalid non-negative decimal %q", raw)
+	}
+	return value, nil
+}
+
+func parseRatio(raw string) (float64, error) {
+	value, err := parseNonNegativeDecimal(raw)
+	if err != nil || value > 1 {
+		return 0, fmt.Errorf("invalid ratio %q", raw)
+	}
+	return value, nil
+}
+
+// parseMinSignedBlocks reproduces the Cosmos SDK's decimal multiplication and
+// RoundInt64 behavior without converting the product through binary floating point.
+func parseMinSignedBlocks(raw string, window int64) (float64, int64, error) {
+	ratio, ok := new(big.Rat).SetString(raw)
+	if !ok || ratio.Sign() < 0 || ratio.Cmp(big.NewRat(1, 1)) > 0 {
+		return 0, 0, fmt.Errorf("invalid ratio %q", raw)
+	}
+	floatRatio, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(floatRatio) || math.IsInf(floatRatio, 0) {
+		return 0, 0, fmt.Errorf("invalid ratio %q", raw)
+	}
+
+	product := new(big.Rat).Mul(ratio, new(big.Rat).SetInt64(window))
+	quotient := new(big.Int)
+	remainder := new(big.Int)
+	quotient.QuoRem(product.Num(), product.Denom(), remainder)
+	if new(big.Int).Lsh(remainder, 1).Cmp(product.Denom()) >= 0 {
+		quotient.Add(quotient, big.NewInt(1))
+	}
+	if !quotient.IsInt64() {
+		return 0, 0, fmt.Errorf("rounded signed-block minimum is out of int64 range")
+	}
+	return floatRatio, quotient.Int64(), nil
+}
+
 // ErrNoUpgradePlan reports that no chain upgrade is currently scheduled, which is
 // the normal state rather than a failure.
 var ErrNoUpgradePlan = errors.New("no upgrade plan scheduled")
@@ -376,8 +624,14 @@ func (c *RPCClient) QueryCometStatus() (ChainStatus, error) {
 		return ChainStatus{}, fmt.Errorf("querying comet status: %w", err)
 	}
 
-	height, _ := strconv.ParseInt(status.Result.SyncInfo.LatestBlockHeight, 10, 64)
-	blockTime, _ := time.Parse(time.RFC3339, status.Result.SyncInfo.LatestBlockTime)
+	height, err := strconv.ParseInt(status.Result.SyncInfo.LatestBlockHeight, 10, 64)
+	if err != nil || height <= 0 {
+		return ChainStatus{}, fmt.Errorf("invalid latest block height %q", status.Result.SyncInfo.LatestBlockHeight)
+	}
+	blockTime, err := time.Parse(time.RFC3339Nano, status.Result.SyncInfo.LatestBlockTime)
+	if err != nil {
+		return ChainStatus{}, fmt.Errorf("invalid latest block time %q: %w", status.Result.SyncInfo.LatestBlockTime, err)
+	}
 	return ChainStatus{
 		ChainID:   status.Result.NodeInfo.Network,
 		Height:    height,

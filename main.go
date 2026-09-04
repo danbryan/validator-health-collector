@@ -28,6 +28,7 @@ func main() {
 	configPath := flag.String("config", "", "Path to collector YAML configuration")
 	redelegationInterval := flag.Duration("redelegation-interval", 5*time.Minute, "Redelegation scan interval")
 	redelegationWindow := flag.Duration("redelegation-window", 168*time.Hour, "Rolling redelegation aggregation window")
+	managedDelegationInterval := flag.Duration("managed-delegation-interval", 5*time.Minute, "Managed delegation risk scan interval")
 	proposalHistory := flag.Duration(
 		"proposal-history",
 		collector.DefaultProposalHistoryWindow,
@@ -44,6 +45,9 @@ func main() {
 	}
 	if *redelegationWindow <= 0 {
 		log.Fatalf("-redelegation-window must be positive, got %v", *redelegationWindow)
+	}
+	if *managedDelegationInterval <= 0 {
+		log.Fatalf("-managed-delegation-interval must be positive, got %v", *managedDelegationInterval)
 	}
 
 	// The entity map is what turns per-validator power into per-operator power, so
@@ -83,14 +87,16 @@ func main() {
 		*redelegationInterval,
 		*redelegationWindow,
 	)
+	c.ConfigureManagedDelegations(cfg.ManagedDelegations, *managedDelegationInterval)
 
 	// Register metrics with Prometheus
 	prometheus.MustRegister(c.Metrics())
 
-	// Start the snapshot and redelegation loops independently. The latter waits
-	// until the initial snapshot has resolved endpoint capabilities.
+	// Start all scanners independently. The specialized scanners wait until the
+	// initial snapshot has resolved endpoint capabilities.
 	go c.Run(*pollInterval)
 	go c.RunRedelegation()
+	go c.RunManagedDelegations()
 
 	// HTTP server for /metrics
 	http.Handle("/metrics", promhttp.Handler())
@@ -106,6 +112,12 @@ func main() {
 	log.Printf("Poll interval: %v", *pollInterval)
 	log.Printf("Redelegation interval: %v, window: %v, alert threshold: %g%%",
 		*redelegationInterval, *redelegationWindow, cfg.Redelegation.AlertThresholdPercent)
+	log.Printf("Managed delegation interval: %v, accounts: %d, jail progress warning: %g%%, critical: %g%%",
+		*managedDelegationInterval, len(cfg.ManagedDelegations.Accounts),
+		cfg.ManagedDelegations.WarningJailProgressPercent, cfg.ManagedDelegations.CriticalJailProgressPercent)
+	for _, account := range cfg.ManagedDelegations.Accounts {
+		log.Printf("Managed delegation account: %s (%s)", account.Name, account.Address)
+	}
 	log.Printf("Closed proposal history: %v", *proposalHistory)
 
 	server := &http.Server{

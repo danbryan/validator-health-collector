@@ -43,6 +43,15 @@ func boolGauge(b bool) float64 {
 	return 0
 }
 
+// blocksUntilJail reflects the SDK's strict missed > maxMissed jail check.
+func blocksUntilJail(maxMissed int64, missed float64) float64 {
+	remaining := float64(maxMissed) - missed + 1
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
 // pubKeyOf pulls the base64 ed25519 consensus key out of a validator record.
 func pubKeyOf(v Validator) string {
 	if v.ConsensusPubKey == nil {
@@ -131,9 +140,36 @@ type Metrics struct {
 	RedelegationThresholdCrossed *prometheus.GaugeVec
 	RedelegationScanSuccess      prometheus.Gauge
 	RedelegationScanLastSuccess  prometheus.Gauge
+
+	managedMu                               sync.RWMutex
+	ManagedDelegationScanSuccess            prometheus.Gauge
+	ManagedDelegationScanLastSuccess        prometheus.Gauge
+	ManagedDelegationConfiguredAccounts     prometheus.Gauge
+	ManagedDelegationWarningJailProgress    prometheus.Gauge
+	ManagedDelegationCriticalJailProgress   prometheus.Gauge
+	ManagedDelegationAccountATOM            *prometheus.GaugeVec
+	ManagedValidatorDelegationATOM          *prometheus.GaugeVec
+	ManagedValidatorPortfolioShare          *prometheus.GaugeVec
+	ManagedValidatorMissedBlocks            *prometheus.GaugeVec
+	ManagedValidatorMissedRatio             *prometheus.GaugeVec
+	ManagedValidatorJailProgress            *prometheus.GaugeVec
+	ManagedValidatorBlocksToJail            *prometheus.GaugeVec
+	ManagedValidatorSecondsToJail           *prometheus.GaugeVec
+	ManagedValidatorRecentMissRate          *prometheus.GaugeVec
+	ManagedValidatorActive                  *prometheus.GaugeVec
+	ManagedValidatorJailed                  *prometheus.GaugeVec
+	ManagedValidatorTombstoned              *prometheus.GaugeVec
+	ManagedValidatorDowntimeSlashExposure   *prometheus.GaugeVec
+	ManagedValidatorDoubleSignSlashExposure *prometheus.GaugeVec
+	ManagedValidatorEstimatedRewardsLost    *prometheus.GaugeVec
+	ManagedValidatorRedelegationLocked      *prometheus.GaugeVec
+	ManagedValidatorEstimatedRedelegatable  *prometheus.GaugeVec
+	ManagedValidatorNextRedelegationUnlock  *prometheus.GaugeVec
+	ManagedValidatorFinalRedelegationUnlock *prometheus.GaugeVec
 }
 
 func NewMetrics() *Metrics {
+	managedValidatorLabels := []string{"operator_address", "moniker", "entity", "consensus_address", "accounts"}
 	return &Metrics{
 		LastSuccess: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "validator_health_collector_last_success_timestamp_seconds",
@@ -185,20 +221,20 @@ func NewMetrics() *Metrics {
 		}, []string{"validator"}),
 		ValMissedBlocksInfo: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "validator_health_validator_missed_blocks_info",
-			Help: "Missed blocks in the current signing window for active-set entities above the alert threshold.",
-		}, []string{"entity"}),
+			Help: "Missed blocks in the current signing window for active-set validators above the alert threshold.",
+		}, []string{"operator_address", "moniker", "entity", "consensus_address"}),
 		ValMissedRatio: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "validator_health_validator_missed_ratio",
 			Help: "Missed blocks as a fraction of the signing window (0-1).",
-		}, []string{"entity"}),
+		}, []string{"operator_address", "moniker", "entity", "consensus_address"}),
 		ValBlocksToJail: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "validator_health_validator_blocks_to_jail",
 			Help: "Blocks a validator can still miss in the current window before being jailed.",
-		}, []string{"entity"}),
+		}, []string{"operator_address", "moniker", "entity", "consensus_address"}),
 		ValSecondsToJail: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "validator_health_validator_seconds_to_jail",
 			Help: "Estimated seconds until jailing if the validator keeps missing every block, using the measured block interval.",
-		}, []string{"entity"}),
+		}, []string{"operator_address", "moniker", "entity", "consensus_address"}),
 		ValAtRiskPower: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "validator_health_validator_at_risk_power_ratio",
 			Help: "Voting power share held by an entity at risk of being jailed (0-1).",
@@ -355,6 +391,102 @@ func NewMetrics() *Metrics {
 			Name: "validator_health_redelegation_scan_last_success_timestamp_seconds",
 			Help: "Unix timestamp of the last complete redelegation scan.",
 		}),
+		ManagedDelegationScanSuccess: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "validator_health_managed_delegation_scan_success",
+			Help: "Whether the last managed-delegation scan completed without partial core data (1) or failed (0).",
+		}),
+		ManagedDelegationScanLastSuccess: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "validator_health_managed_delegation_scan_last_success_timestamp_seconds",
+			Help: "Unix timestamp of the last complete managed-delegation scan.",
+		}),
+		ManagedDelegationConfiguredAccounts: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "validator_health_managed_delegation_configured_accounts",
+			Help: "Number of configured managed delegator account addresses.",
+		}),
+		ManagedDelegationWarningJailProgress: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "validator_health_managed_delegation_warning_jail_progress_ratio",
+			Help: "Configured warning threshold for managed-validator jail progress (0-1).",
+		}),
+		ManagedDelegationCriticalJailProgress: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "validator_health_managed_delegation_critical_jail_progress_ratio",
+			Help: "Configured critical threshold for managed-validator jail progress (0-1).",
+		}),
+		ManagedDelegationAccountATOM: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_managed_delegation_account_atom",
+			Help: "Current positive managed delegation in ATOM by configured account and validator.",
+		}, []string{"account", "delegator_address", "operator_address", "moniker", "entity", "consensus_address"}),
+		ManagedValidatorDelegationATOM: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_managed_validator_delegation_atom",
+			Help: "Current positive managed delegation in ATOM aggregated by validator.",
+		}, managedValidatorLabels),
+		ManagedValidatorPortfolioShare: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_managed_validator_portfolio_share_ratio",
+			Help: "Share of all currently managed delegation held with this validator (0-1).",
+		}, managedValidatorLabels),
+		ManagedValidatorMissedBlocks: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_managed_validator_missed_blocks",
+			Help: "Current slashing-module missed-block counter for a managed validator.",
+		}, managedValidatorLabels),
+		ManagedValidatorMissedRatio: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_managed_validator_missed_ratio",
+			Help: "Managed validator missed blocks divided by the live signed-blocks window (0-1).",
+		}, managedValidatorLabels),
+		ManagedValidatorJailProgress: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_managed_validator_jail_progress_ratio",
+			Help: "Managed validator missed blocks divided by the live maximum missed blocks before jail, clamped to 0-1.",
+		}, managedValidatorLabels),
+		ManagedValidatorBlocksToJail: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_managed_validator_blocks_to_jail",
+			Help: "Blocks of live jail headroom remaining if every subsequent block is missed.",
+		}, managedValidatorLabels),
+		ManagedValidatorSecondsToJail: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_managed_validator_seconds_to_jail",
+			Help: "Estimated seconds of jail headroom if every subsequent block is missed, using the measured block interval.",
+		}, managedValidatorLabels),
+		ManagedValidatorRecentMissRate: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_managed_validator_recent_miss_rate_ratio",
+			Help: "Fraction of eligible sampled blocks missed by a managed validator across the latest 10 completed CometBFT commits; validators eligible for none report 0.",
+		}, managedValidatorLabels),
+		ManagedValidatorActive: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_managed_validator_active",
+			Help: "Whether a validator holding managed delegation is in the current CometBFT consensus set (1) or not (0).",
+		}, managedValidatorLabels),
+		ManagedValidatorJailed: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_managed_validator_jailed",
+			Help: "Whether a validator holding managed delegation is currently jailed (1) or not (0).",
+		}, managedValidatorLabels),
+		ManagedValidatorTombstoned: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_managed_validator_tombstoned",
+			Help: "Whether a validator holding managed delegation is tombstoned (1) or not (0).",
+		}, managedValidatorLabels),
+		ManagedValidatorDowntimeSlashExposure: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_managed_validator_downtime_slash_exposure_atom",
+			Help: "Current managed ATOM exposed to the live downtime slash fraction.",
+		}, managedValidatorLabels),
+		ManagedValidatorDoubleSignSlashExposure: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_managed_validator_double_sign_slash_exposure_atom",
+			Help: "Current managed ATOM exposed to the live double-sign slash fraction.",
+		}, managedValidatorLabels),
+		ManagedValidatorEstimatedRewardsLost: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_managed_validator_estimated_rewards_lost_per_hour_atom",
+			Help: "Estimated ATOM rewards lost per hour while this managed delegation earns no rewards, using live annual provisions, bonded tokens, community tax, and validator commission; omitted when optional inputs are unavailable.",
+		}, managedValidatorLabels),
+		ManagedValidatorRedelegationLocked: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_managed_validator_redelegation_locked_atom",
+			Help: "Managed ATOM locked from another redelegation because current chain state returns a receiving redelegation entry for its delegator-account and destination-validator pair.",
+		}, managedValidatorLabels),
+		ManagedValidatorEstimatedRedelegatable: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_managed_validator_estimated_redelegatable_atom",
+			Help: "Managed ATOM currently redelegatable after excluding entire account-validator positions with receiving redelegation entries returned by current chain state.",
+		}, managedValidatorLabels),
+		ManagedValidatorNextRedelegationUnlock: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_managed_validator_next_redelegation_unlock_timestamp_seconds",
+			Help: "Earliest final unlock timestamp among locked managed account-validator positions, or 0 when none is locked.",
+		}, managedValidatorLabels),
+		ManagedValidatorFinalRedelegationUnlock: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "validator_health_managed_validator_final_redelegation_unlock_timestamp_seconds",
+			Help: "Latest final unlock timestamp among locked managed account-validator positions, or 0 when none is locked.",
+		}, managedValidatorLabels),
 	}
 }
 
@@ -415,6 +547,30 @@ func (m *Metrics) Describe(ch chan<- *prometheus.Desc) {
 	m.RedelegationThresholdCrossed.Describe(ch)
 	m.RedelegationScanSuccess.Describe(ch)
 	m.RedelegationScanLastSuccess.Describe(ch)
+	m.ManagedDelegationScanSuccess.Describe(ch)
+	m.ManagedDelegationScanLastSuccess.Describe(ch)
+	m.ManagedDelegationConfiguredAccounts.Describe(ch)
+	m.ManagedDelegationWarningJailProgress.Describe(ch)
+	m.ManagedDelegationCriticalJailProgress.Describe(ch)
+	m.ManagedDelegationAccountATOM.Describe(ch)
+	m.ManagedValidatorDelegationATOM.Describe(ch)
+	m.ManagedValidatorPortfolioShare.Describe(ch)
+	m.ManagedValidatorMissedBlocks.Describe(ch)
+	m.ManagedValidatorMissedRatio.Describe(ch)
+	m.ManagedValidatorJailProgress.Describe(ch)
+	m.ManagedValidatorBlocksToJail.Describe(ch)
+	m.ManagedValidatorSecondsToJail.Describe(ch)
+	m.ManagedValidatorRecentMissRate.Describe(ch)
+	m.ManagedValidatorActive.Describe(ch)
+	m.ManagedValidatorJailed.Describe(ch)
+	m.ManagedValidatorTombstoned.Describe(ch)
+	m.ManagedValidatorDowntimeSlashExposure.Describe(ch)
+	m.ManagedValidatorDoubleSignSlashExposure.Describe(ch)
+	m.ManagedValidatorEstimatedRewardsLost.Describe(ch)
+	m.ManagedValidatorRedelegationLocked.Describe(ch)
+	m.ManagedValidatorEstimatedRedelegatable.Describe(ch)
+	m.ManagedValidatorNextRedelegationUnlock.Describe(ch)
+	m.ManagedValidatorFinalRedelegationUnlock.Describe(ch)
 }
 
 // Collect implements prometheus.Collector.
@@ -474,6 +630,33 @@ func (m *Metrics) Collect(ch chan<- prometheus.Metric) {
 	m.RedelegationThresholdCrossed.Collect(ch)
 	m.RedelegationScanSuccess.Collect(ch)
 	m.RedelegationScanLastSuccess.Collect(ch)
+
+	m.managedMu.RLock()
+	defer m.managedMu.RUnlock()
+	m.ManagedDelegationScanSuccess.Collect(ch)
+	m.ManagedDelegationScanLastSuccess.Collect(ch)
+	m.ManagedDelegationConfiguredAccounts.Collect(ch)
+	m.ManagedDelegationWarningJailProgress.Collect(ch)
+	m.ManagedDelegationCriticalJailProgress.Collect(ch)
+	m.ManagedDelegationAccountATOM.Collect(ch)
+	m.ManagedValidatorDelegationATOM.Collect(ch)
+	m.ManagedValidatorPortfolioShare.Collect(ch)
+	m.ManagedValidatorMissedBlocks.Collect(ch)
+	m.ManagedValidatorMissedRatio.Collect(ch)
+	m.ManagedValidatorJailProgress.Collect(ch)
+	m.ManagedValidatorBlocksToJail.Collect(ch)
+	m.ManagedValidatorSecondsToJail.Collect(ch)
+	m.ManagedValidatorRecentMissRate.Collect(ch)
+	m.ManagedValidatorActive.Collect(ch)
+	m.ManagedValidatorJailed.Collect(ch)
+	m.ManagedValidatorTombstoned.Collect(ch)
+	m.ManagedValidatorDowntimeSlashExposure.Collect(ch)
+	m.ManagedValidatorDoubleSignSlashExposure.Collect(ch)
+	m.ManagedValidatorEstimatedRewardsLost.Collect(ch)
+	m.ManagedValidatorRedelegationLocked.Collect(ch)
+	m.ManagedValidatorEstimatedRedelegatable.Collect(ch)
+	m.ManagedValidatorNextRedelegationUnlock.Collect(ch)
+	m.ManagedValidatorFinalRedelegationUnlock.Collect(ch)
 }
 
 // Collector orchestrates the polling and metric updates.
@@ -497,21 +680,27 @@ type Collector struct {
 	redelegationInterval  time.Duration
 	redelegationReady     chan struct{}
 	redelegationReadyOnce sync.Once
+
+	managedDelegations         *ManagedDelegationScanner
+	managedDelegationInterval  time.Duration
+	managedDelegationReady     chan struct{}
+	managedDelegationReadyOnce sync.Once
 }
 
 // New builds a collector that discovers its endpoints through the resolver at the
 // start of every collection cycle.
 func New(resolver *endpoints.Resolver, entityMap map[string]string) *Collector {
 	return &Collector{
-		restClient:            NewRESTClient(),
-		rpcClient:             NewRPCClient(),
-		resolver:              resolver,
-		entityMap:             entityMap,
-		metrics:               NewMetrics(),
-		proposalHistoryWindow: DefaultProposalHistoryWindow,
-		prevValidators:        make(map[string]bool),
-		firstRun:              true,
-		redelegationReady:     make(chan struct{}),
+		restClient:             NewRESTClient(),
+		rpcClient:              NewRPCClient(),
+		resolver:               resolver,
+		entityMap:              entityMap,
+		metrics:                NewMetrics(),
+		proposalHistoryWindow:  DefaultProposalHistoryWindow,
+		prevValidators:         make(map[string]bool),
+		firstRun:               true,
+		redelegationReady:      make(chan struct{}),
+		managedDelegationReady: make(chan struct{}),
 	}
 }
 
@@ -553,6 +742,10 @@ func (c *Collector) resolveEndpoints() error {
 	if c.redelegation != nil {
 		c.redelegation.SetEndpoints(res.RESTAddresses, res.TxSearchAddresses)
 		c.redelegationReadyOnce.Do(func() { close(c.redelegationReady) })
+	}
+	if c.managedDelegations != nil {
+		c.managedDelegations.SetEndpoints(res.RESTAddresses, res.RPCAddresses)
+		c.managedDelegationReadyOnce.Do(func() { close(c.managedDelegationReady) })
 	}
 
 	// Republish from scratch so a rotation does not leave the previous endpoint
@@ -873,38 +1066,23 @@ func (c *Collector) CollectSnapshot() error {
 		}
 	}
 
-	// Build consensus address -> moniker map from validator set
-	consensusToMoniker := make(map[string]string)
-	monikerToValoper := make(map[string]string, len(validators))
+	// Build consensus address -> validator metadata from the active set.
+	consensusToValidator := make(map[string]Validator)
 	for _, v := range validators {
-		monikerToValoper[v.Description.Moniker] = v.OperatorAddress
-	}
-	for _, v := range validators {
-		if v.ConsensusPubKey == nil {
-			continue
-		}
-		pubKeyType, ok := v.ConsensusPubKey["@type"].(string)
-		if !ok || pubKeyType != "/cosmos.crypto.ed25519.PubKey" {
-			continue
-		}
-		keyStr, ok := v.ConsensusPubKey["key"].(string)
-		if !ok || keyStr == "" {
-			continue
-		}
-		consAddr, err := consensusAddressFromPubKey(keyStr)
+		consAddr, err := consensusAddressFromPubKey(pubKeyOf(v))
 		if err != nil {
 			continue
 		}
-		consensusToMoniker[consAddr] = v.Description.Moniker
+		consensusToValidator[consAddr] = v
 	}
 
 	// Slashing metrics. Only active-set validators are published, and only the
 	// ones already missing enough blocks to be worth looking at; below that the
 	// counter is normal operating noise (restarts, brief maintenance).
 	//
-	// Everything here is keyed by entity. An entity is the entity-map name when
-	// one exists, and the validator's own moniker otherwise, so the label means
-	// the same thing on every panel.
+	// Every risk series carries exact validator identity plus entity attribution.
+	// An entity is the entity-map name when one exists, and the validator's own
+	// moniker otherwise.
 	c.metrics.ValMissedBlocksInfo.Reset()
 	c.metrics.ValMissedRatio.Reset()
 	c.metrics.ValBlocksToJail.Reset()
@@ -916,26 +1094,25 @@ func (c *Collector) CollectSnapshot() error {
 		mb, _ := strconv.ParseFloat(info.MissedBlocksCounter, 64)
 		c.metrics.ValMissedBlocks.WithLabelValues(info.Address).Set(mb)
 
-		moniker, inActiveSet := consensusToMoniker[info.Address]
+		validator, inActiveSet := consensusToValidator[info.Address]
 		if !inActiveSet || mb < alertThreshold {
 			continue
 		}
-		entity := c.entityMap[monikerToValoper[moniker]]
+		moniker := validator.Description.Moniker
+		entity := c.entityMap[validator.OperatorAddress]
 		if entity == "" {
 			entity = moniker
 		}
+		labels := []string{validator.OperatorAddress, moniker, entity, info.Address}
 
-		blocksToJail := float64(slashing.MaxMissedBlocks) - mb
-		if blocksToJail < 0 {
-			blocksToJail = 0
-		}
+		blocksToJail := blocksUntilJail(slashing.MaxMissedBlocks, mb)
 
-		c.metrics.ValMissedBlocksInfo.WithLabelValues(entity).Set(mb)
-		c.metrics.ValMissedRatio.WithLabelValues(entity).Set(mb / float64(slashing.SignedBlocksWindow))
-		c.metrics.ValBlocksToJail.WithLabelValues(entity).Set(blocksToJail)
+		c.metrics.ValMissedBlocksInfo.WithLabelValues(labels...).Set(mb)
+		c.metrics.ValMissedRatio.WithLabelValues(labels...).Set(mb / float64(slashing.SignedBlocksWindow))
+		c.metrics.ValBlocksToJail.WithLabelValues(labels...).Set(blocksToJail)
 		// Worst case: the validator signs nothing from here on, so every
 		// remaining block of headroom is consumed at the measured block rate.
-		c.metrics.ValSecondsToJail.WithLabelValues(entity).Set(blocksToJail * blockInterval)
+		c.metrics.ValSecondsToJail.WithLabelValues(labels...).Set(blocksToJail * blockInterval)
 		// How much voting power leaves the set if this entity is jailed.
 		if power, ok := entityPowerShare[entity]; ok {
 			c.metrics.ValAtRiskPower.WithLabelValues(entity).Set(power)
@@ -951,10 +1128,14 @@ func (c *Collector) CollectSnapshot() error {
 	c.metrics.SlashingParam.WithLabelValues("slash_fraction_downtime").Set(slashing.SlashFractionDowntime)
 	c.metrics.ChainBlockTime.Set(blockInterval)
 
-	// Validator info (moniker mapping)
+	// Validator info (consensus, moniker, and operator mapping).
 	for _, v := range validators {
+		consensusAddress, consensusErr := consensusAddressFromPubKey(pubKeyOf(v))
+		if consensusErr != nil {
+			continue
+		}
 		c.metrics.ValInfo.WithLabelValues(
-			v.OperatorAddress,
+			consensusAddress,
 			v.Description.Moniker,
 			v.OperatorAddress,
 		).Set(1)
