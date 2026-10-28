@@ -58,6 +58,10 @@ go run . \
 
 Live proposals are always exported. Closed proposals are exported for 14 days by default, matching the shortest retention in the target monitoring stack. Override the bound with `-proposal-history`, for example `-proposal-history=168h`.
 
+Proposals are listed newest first, and the scan stops at the first proposal submitted before the history window could matter. That bound is the chain's own maximum deposit period plus its longest voting period, read from the governance params each cycle. Old proposals are never read, which matters because chain upgrades can remove message types that old proposals still store, and nodes then fail to decode them.
+
+If the proposal list still fails after an upgrade, the collector reads proposals one ID at a time, skipping deleted IDs and isolating any proposal no endpoint can decode. Undecodable proposals are counted in `validator_health_governance_unreadable_proposals`. One the collector last saw closed is ignored; one that may still be open fails the governance section, because it could be a vote nobody can see.
+
 Turnout history is built prospectively from the collector's hourly Prometheus samples. The collector does not reconstruct old vote timelines from transactions. Entity-level vote attribution is queried only for live proposals through the current governance votes REST API; final tally, quorum, and veto state remain available even if that optional attribution query fails.
 
 ## Entity mapping

@@ -103,6 +103,14 @@ func (r *rotator) budget() int {
 // rotate rather than fail, which is how a transient proxy error was previously
 // able to corrupt a whole snapshot.
 func fetchJSON(rot *rotator, client *http.Client, kind, path string, dst any) error {
+	return fetchJSONUnless(rot, client, kind, path, dst, nil)
+}
+
+// fetchJSONUnless behaves like fetchJSON, except that an error for which final
+// returns true is returned at once instead of rotating. It is for answers every
+// healthy node gives alike, such as a missing proposal ID, where asking the next
+// endpoint only costs requests.
+func fetchJSONUnless(rot *rotator, client *http.Client, kind, path string, dst any, final func(error) bool) error {
 	attempts := rot.budget()
 	if attempts == 0 {
 		return fmt.Errorf("no %s endpoint available", kind)
@@ -115,10 +123,39 @@ func fetchJSON(rot *rotator, client *http.Client, kind, path string, dst any) er
 		if lastErr == nil {
 			return nil
 		}
+		if final != nil && final(lastErr) {
+			return lastErr
+		}
 		log.Printf("WARN: %s %s%s failed, rotating: %v", kind, base, path, lastErr)
 		rot.advance()
 	}
 	return fmt.Errorf("all %d %s attempts failed for %s: %w", attempts, kind, path, lastErr)
+}
+
+// statusError is a response that arrived with a non-200 HTTP status. It keeps
+// the status and body so callers can tell a chain answer, such as a gRPC
+// NotFound, from a proxy or rate-limit failure.
+type statusError struct {
+	Status int
+	Body   []byte
+}
+
+func (e *statusError) Error() string {
+	return fmt.Sprintf("status %d: %s", e.Status, snippet(e.Body))
+}
+
+// grpcCode returns the gRPC status code carried in a grpc-gateway error body, or
+// -1 when the body is not one. Cosmos REST errors look like
+// {"code":13,"message":"...","details":[]}.
+func (e *statusError) grpcCode() int {
+	var body struct {
+		Code    *int   `json:"code"`
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(e.Body, &body) != nil || body.Code == nil {
+		return -1
+	}
+	return *body.Code
 }
 
 // getJSONOnce performs a single request with no rotation.
@@ -144,7 +181,7 @@ func getJSONOnce(client *http.Client, url string, dst any) error {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("status %d: %s", resp.StatusCode, snippet(body))
+		return &statusError{Status: resp.StatusCode, Body: body}
 	}
 
 	if dst == nil {
