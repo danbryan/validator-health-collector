@@ -373,43 +373,6 @@ func (c *RPCClient) MeasureBlockTime(sampleBlocks int64) (float64, error) {
 	return tLatest.Sub(tOld).Seconds() / float64(hLatest-hOld), nil
 }
 
-// QueryRelevantProposals scans proposal summaries once and returns everything
-// currently in voting plus closed proposals whose voting window ended on or
-// after cutoff. This bounds dashboard history by time rather than an arbitrary
-// proposal count while avoiding a second governance-list scan.
-func (c *RESTClient) QueryRelevantProposals(cutoff time.Time) (active, recentClosed []Proposal, err error) {
-	var nextKey string
-	for {
-		path := "/cosmos/gov/v1/proposals?pagination.limit=100"
-		if nextKey != "" {
-			path += "&pagination.key=" + url.QueryEscape(nextKey)
-		}
-
-		var resp ProposalsResponse
-		if getErr := c.get(path, &resp); getErr != nil {
-			return nil, nil, fmt.Errorf("querying proposals: %w", getErr)
-		}
-		for _, proposal := range resp.Proposals {
-			switch proposal.Status {
-			case statusVotingPeriod:
-				active = append(active, proposal)
-			case statusDepositPeriod:
-				continue
-			default:
-				votingEnd, parseErr := time.Parse(time.RFC3339, proposal.VotingEndTime)
-				if parseErr == nil && !votingEnd.Before(cutoff) {
-					recentClosed = append(recentClosed, proposal)
-				}
-			}
-		}
-		if resp.Pagination.NextKey == "" || resp.Pagination.NextKey == nullNextKey {
-			break
-		}
-		nextKey = resp.Pagination.NextKey
-	}
-	return active, recentClosed, nil
-}
-
 // QueryLiveTally fetches the running tally for a proposal still in its voting
 // period. The proposal object's final_tally_result stays zeroed until voting
 // closes, so an open proposal must be read from this endpoint instead.
@@ -479,16 +442,39 @@ func (c *RESTClient) QueryProposalByID(id string) (*Proposal, error) {
 	return &resp.Proposal, nil
 }
 
-// QueryGovParams fetches governance tallying parameters.
-func (c *RESTClient) QueryGovParams() (float64, float64, float64, error) {
+// GovParams is the governance configuration the collector depends on.
+type GovParams struct {
+	Quorum        float64
+	Threshold     float64
+	VetoThreshold float64
+	// ProposalLifespan is the longest a proposal can take from submission to the
+	// end of its vote: the deposit period plus the longer of the two voting
+	// periods. Zero when the chain did not report the periods.
+	ProposalLifespan time.Duration
+}
+
+// QueryGovParams fetches governance parameters. The tallying endpoint returns the
+// full gov params object on SDK 0.47 and later, so one request covers both the
+// tally thresholds and the deposit and voting periods.
+func (c *RESTClient) QueryGovParams() (GovParams, error) {
 	var resp GovParamsResponse
 	if err := c.get("/cosmos/gov/v1/params/tallying", &resp); err != nil {
-		return 0, 0, 0, fmt.Errorf("querying gov params: %w", err)
+		return GovParams{}, fmt.Errorf("querying gov params: %w", err)
 	}
 	q, _ := strconv.ParseFloat(resp.Params.Quorum, 64)
 	t, _ := strconv.ParseFloat(resp.Params.Threshold, 64)
 	v, _ := strconv.ParseFloat(resp.Params.VetoThreshold, 64)
-	return q, t, v, nil
+
+	params := GovParams{Quorum: q, Threshold: t, VetoThreshold: v}
+	deposit, depositErr := time.ParseDuration(resp.Params.MaxDepositPeriod)
+	voting, votingErr := time.ParseDuration(resp.Params.VotingPeriod)
+	if depositErr == nil && votingErr == nil && deposit > 0 && voting > 0 {
+		if expedited, err := time.ParseDuration(resp.Params.ExpeditedVotingPeriod); err == nil && expedited > voting {
+			voting = expedited
+		}
+		params.ProposalLifespan = deposit + voting
+	}
+	return params, nil
 }
 
 // QuerySigningInfos fetches all signing infos with pagination.

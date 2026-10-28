@@ -5,7 +5,6 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
-	"time"
 )
 
 func TestQueryProposalVotesPreservesWeightedOptionsAndPagination(t *testing.T) {
@@ -52,35 +51,6 @@ func TestQueryProposalVotesPreservesWeightedOptionsAndPagination(t *testing.T) {
 	}
 	if vote := votes["cosmos1second"]; vote.Option != "NO" || vote.Options["NO"] != 1 {
 		t.Fatalf("second vote = %#v, want a full NO vote", vote)
-	}
-}
-
-func TestQueryRelevantProposalsUsesTimeWindowAndAlwaysIncludesLive(t *testing.T) {
-	t.Parallel()
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{
-  "proposals": [
-    {"id":"live","status":"PROPOSAL_STATUS_VOTING_PERIOD","voting_end_time":"2026-09-01T00:00:00Z"},
-    {"id":"recent","status":"PROPOSAL_STATUS_PASSED","voting_end_time":"2026-08-10T00:00:00Z"},
-    {"id":"old","status":"PROPOSAL_STATUS_REJECTED","voting_end_time":"2026-07-01T00:00:00Z"},
-    {"id":"deposit","status":"PROPOSAL_STATUS_DEPOSIT_PERIOD","voting_end_time":"2026-08-20T00:00:00Z"}
-  ],
-  "pagination": {"next_key": null}
-}`))
-	}))
-	defer server.Close()
-
-	cutoff := time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC)
-	active, closed, err := NewRESTClient(server.URL).QueryRelevantProposals(cutoff)
-	if err != nil {
-		t.Fatalf("QueryRelevantProposals() returned an unexpected error: %v", err)
-	}
-	if len(active) != 1 || active[0].ID != "live" {
-		t.Fatalf("active = %#v, want only the live proposal", active)
-	}
-	if len(closed) != 1 || closed[0].ID != "recent" {
-		t.Fatalf("closed = %#v, want only the closed proposal inside the cutoff", closed)
 	}
 }
 

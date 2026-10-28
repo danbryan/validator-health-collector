@@ -63,6 +63,8 @@ type Proposal struct {
 	ID               string      `json:"id"`
 	Status           string      `json:"status"`
 	Title            string      `json:"title"`
+	SubmitTime       string      `json:"submit_time"`
+	DepositEndTime   string      `json:"deposit_end_time"`
 	VotingStartTime  string      `json:"voting_start_time"`
 	VotingEndTime    string      `json:"voting_end_time"`
 	FinalTallyResult TallyResult `json:"final_tally_result"`
@@ -94,9 +96,12 @@ type ProposalVotesResponse struct {
 
 // GovTallyParams are the governance thresholds that decide a proposal's outcome.
 type GovTallyParams struct {
-	Quorum        string `json:"quorum"`
-	Threshold     string `json:"threshold"`
-	VetoThreshold string `json:"veto_threshold"`
+	Quorum                string `json:"quorum"`
+	Threshold             string `json:"threshold"`
+	VetoThreshold         string `json:"veto_threshold"`
+	MaxDepositPeriod      string `json:"max_deposit_period"`
+	VotingPeriod          string `json:"voting_period"`
+	ExpeditedVotingPeriod string `json:"expedited_voting_period"`
 }
 
 // GovParamsResponse wraps the tallying-params query.

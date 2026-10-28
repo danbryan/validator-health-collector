@@ -130,6 +130,7 @@ type Metrics struct {
 	EndpointInfo                 *prometheus.GaugeVec
 	GovProposalLive              *prometheus.GaugeVec
 	SectionSuccess               *prometheus.GaugeVec
+	GovUnreadableProposals       prometheus.Gauge
 	RedelegationAlertThreshold   prometheus.Gauge
 	RedelegationOutflowRatio     *prometheus.GaugeVec
 	RedelegationOutflowATOM      *prometheus.GaugeVec
@@ -351,6 +352,10 @@ func NewMetrics() *Metrics {
 			Name: "validator_health_collector_section_success",
 			Help: "Whether the last attempt at a section of the collection cycle succeeded (1) or failed (0).",
 		}, []string{"section"}),
+		GovUnreadableProposals: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "validator_health_governance_unreadable_proposals",
+			Help: "Proposals inside the scan window that no endpoint could decode on the last successful scan, usually after a chain upgrade dropped a message type. Ones that may still be open fail the governance section.",
+		}),
 		RedelegationAlertThreshold: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "validator_health_redelegation_alert_threshold_ratio",
 			Help: "Configured rolling redelegation outflow alert threshold as a ratio (0-1).",
@@ -537,6 +542,7 @@ func (m *Metrics) Describe(ch chan<- *prometheus.Desc) {
 	m.EndpointInfo.Describe(ch)
 	m.GovProposalLive.Describe(ch)
 	m.SectionSuccess.Describe(ch)
+	m.GovUnreadableProposals.Describe(ch)
 	m.RedelegationAlertThreshold.Describe(ch)
 	m.RedelegationOutflowRatio.Describe(ch)
 	m.RedelegationOutflowATOM.Describe(ch)
@@ -620,6 +626,7 @@ func (m *Metrics) Collect(ch chan<- prometheus.Metric) {
 	m.EndpointInfo.Collect(ch)
 	m.GovProposalLive.Collect(ch)
 	m.SectionSuccess.Collect(ch)
+	m.GovUnreadableProposals.Collect(ch)
 	m.RedelegationAlertThreshold.Collect(ch)
 	m.RedelegationOutflowRatio.Collect(ch)
 	m.RedelegationOutflowATOM.Collect(ch)
@@ -669,6 +676,11 @@ type Collector struct {
 
 	proposalHistoryWindow time.Duration
 
+	// highestProposalID and proposalMemory carry proposal state across cycles, so
+	// discovery still works when a chain upgrade leaves some proposals unreadable.
+	highestProposalID uint64
+	proposalMemory    map[uint64]Proposal
+
 	lastSlashingParams *SlashingParams
 	lastBlockTime      float64
 
@@ -697,6 +709,7 @@ func New(resolver *endpoints.Resolver, entityMap map[string]string) *Collector {
 		entityMap:              entityMap,
 		metrics:                NewMetrics(),
 		proposalHistoryWindow:  DefaultProposalHistoryWindow,
+		proposalMemory:         make(map[uint64]Proposal),
 		prevValidators:         make(map[string]bool),
 		firstRun:               true,
 		redelegationReady:      make(chan struct{}),
@@ -862,16 +875,28 @@ func (c *Collector) CollectSnapshot() error {
 	// cycle's values in place lets time-bound alerts keep firing on a snapshot
 	// nobody can refresh. The cycle also stops reporting itself successful at the
 	// end, so CollectorStale eventually surfaces the blindness.
-	proposalCutoff := time.Now().Add(-c.proposalHistoryWindow)
-	activeProps, recentClosedProps, govErr := c.restClient.QueryRelevantProposals(proposalCutoff)
-	if govErr != nil {
-		log.Printf("WARN: Governance query failed; live proposal series remain retired: %v", govErr)
-	}
-	govQuorum, _, govVeto, govParamsErr := c.restClient.QueryGovParams()
+	//
+	// Params are read first because their deposit and voting periods bound how far
+	// back the proposal scan has to look.
+	govParams, govParamsErr := c.restClient.QueryGovParams()
 	if govParamsErr != nil {
 		log.Printf("WARN: Governance params query failed; retaining the previous veto threshold: %v", govParamsErr)
 	} else {
-		c.metrics.GovVetoThreshold.Set(govVeto)
+		c.metrics.GovVetoThreshold.Set(govParams.VetoThreshold)
+	}
+	govQuorum, govVeto := govParams.Quorum, govParams.VetoThreshold
+
+	proposalCutoff := time.Now().Add(-c.proposalHistoryWindow)
+	scan, govErr := c.restClient.QueryRelevantProposals(
+		proposalCutoff, govParams.ProposalLifespan, c.highestProposalID,
+	)
+	var activeProps, recentClosedProps []Proposal
+	var unreadableErr error
+	if govErr != nil {
+		log.Printf("WARN: Governance query failed; live proposal series remain retired: %v", govErr)
+	} else {
+		activeProps, recentClosedProps = scan.Active, scan.RecentClosed
+		unreadableErr = c.recordProposalScan(scan, proposalScanFloor(proposalCutoff, govParams.ProposalLifespan))
 	}
 
 	// 5. Slashing parameters and block interval. Both drive the jail estimate,
@@ -1192,7 +1217,7 @@ func (c *Collector) CollectSnapshot() error {
 			analysisErr = errors.New("cannot analyze active proposals without the bonded staking pool")
 		}
 	}
-	governanceErr := errors.Join(govErr, govParamsErr, analysisErr)
+	governanceErr := errors.Join(govErr, govParamsErr, unreadableErr, analysisErr)
 	c.metrics.SectionSuccess.WithLabelValues("governance").Set(boolGauge(governanceErr == nil))
 
 	// A partial snapshot is published, because concentration and signing metrics are
@@ -1207,6 +1232,63 @@ func (c *Collector) CollectSnapshot() error {
 	c.metrics.LastSuccess.Set(float64(time.Now().Unix()))
 	log.Println("Snapshot collection complete.")
 	return nil
+}
+
+// recordProposalScan remembers what this scan decoded and reports unreadable
+// proposals that could still be open for voting.
+//
+// A proposal this collector already saw in a final status, or whose vote had
+// already ended, cannot be live, so losing the ability to decode it after an
+// upgrade costs nothing. Anything else might be a vote nobody can see, which is
+// a governance failure. After a restart nothing is remembered, so an unreadable
+// proposal keeps failing the section until it ages past the scan window.
+func (c *Collector) recordProposalScan(scan ProposalScan, floor time.Time) error {
+	if scan.HighestID > c.highestProposalID {
+		c.highestProposalID = scan.HighestID
+	}
+	if scan.UsedFallback {
+		log.Printf("Proposal list was unreadable; read proposals one by one down to %s", floor.Format(time.RFC3339))
+	}
+
+	for _, p := range scan.Seen {
+		if id, err := strconv.ParseUint(p.ID, 10, 64); err == nil {
+			c.proposalMemory[id] = p
+		}
+	}
+	for id, p := range c.proposalMemory {
+		if before, ok := submittedBefore(&p, floor); ok && before {
+			delete(c.proposalMemory, id)
+		}
+	}
+
+	c.metrics.GovUnreadableProposals.Set(float64(len(scan.Unreadable)))
+
+	now := time.Now()
+	var possiblyOpen []uint64
+	for _, id := range scan.Unreadable {
+		if p, ok := c.proposalMemory[id]; ok && proposalClosedBy(&p, now) {
+			log.Printf("Proposal %d is unreadable but was already closed when last decoded; ignoring it", id)
+			continue
+		}
+		possiblyOpen = append(possiblyOpen, id)
+	}
+	if len(possiblyOpen) > 0 {
+		return fmt.Errorf("no endpoint can decode proposals %v, and they may be open for voting", possiblyOpen)
+	}
+	return nil
+}
+
+// proposalClosedBy reports whether a remembered proposal can no longer be live.
+func proposalClosedBy(p *Proposal, now time.Time) bool {
+	switch p.Status {
+	case statusDepositPeriod:
+		return false
+	case statusVotingPeriod:
+		end, err := time.Parse(time.RFC3339, p.VotingEndTime)
+		return err == nil && end.Before(now)
+	default:
+		return p.Status != ""
+	}
 }
 
 // retireLiveProposalSeries drops every governance series that is only meaningful
